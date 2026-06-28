@@ -1,0 +1,4 @@
+interface:
+  display_name: "loghound investigator"
+  short_description: "Explore local loghound logs safely"
+  default_prompt: "Use $loghound-investigator to investigate the current app session with loghound commands."

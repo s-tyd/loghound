@@ -1,0 +1,11 @@
+.dart_tool/
+.packages
+.DS_Store
+.vimana/
+build/
+coverage/
+docs/superpowers/
+loghound/
+logs/
+pubspec.lock
+/loghound-icon.png

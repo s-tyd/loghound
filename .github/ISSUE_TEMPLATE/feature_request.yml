@@ -1,0 +1,36 @@
+name: Feature request
+description: Suggest a loghound capability
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Debugging problem
+      description: What investigation workflow is hard today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the CLI/API or AI-agent workflow you want.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - CLI
+        - Flutter bootstrap
+        - HTTP/body capture
+        - Action capture
+        - Redaction/privacy
+        - AI-agent workflow
+        - Documentation
+  - type: textarea
+    id: risks
+    attributes:
+      label: Privacy or security considerations
+      description: Could this expose bodies, headers, tokens, or personal data?

@@ -1,0 +1,8 @@
+docs/superpowers/
+skills/
+.DS_Store
+.vimana/
+doc/oss-readiness.md
+loghound/
+logs/
+/loghound-icon.png
