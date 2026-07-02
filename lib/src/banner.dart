@@ -2,8 +2,8 @@
 ///
 /// A braille rendering of the loghound mascot (beagle + magnifying glass) from
 /// `loghound-icon.png`, with a `loghound` figlet wordmark directly beneath the
-/// collar tag. Shown when the long-running `serve` / `stay` daemons start. Kept
-/// free of `dart:io` so it stays pure and easy to test; the CLI decides on color.
+/// collar tag. Kept free of `dart:io` so it stays pure and easy to test; the
+/// CLI decides on color.
 ///
 /// Alignment notes: the mascot block is built entirely from braille glyphs —
 /// including its blank cells (U+2800) rather than ASCII spaces — so every cell

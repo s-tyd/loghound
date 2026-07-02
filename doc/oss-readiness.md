@@ -30,12 +30,13 @@ This checklist tracks items that matter before the first public release.
 
 ## Platform Support
 
-The initial SDK uses `dart:io` through `LogHoundClient`, so the first release
-targets Dart CLI, Flutter mobile, Flutter desktop, and local development
-workflows. Flutter Web is not supported yet.
+The SDK transport emits hidden VM Service extension events and does not require
+a local server. The CLI uses `dart:io` for VM Service listening, stdin fallback,
+and filesystem access, so the first release targets Dart CLI, Flutter mobile,
+Flutter desktop, and local development workflows.
 
-If Web support becomes a goal, add a separate browser transport using
-conditional imports rather than weakening the CLI/server package.
+If Web support becomes a goal, verify the bootstrap imports and log transport
+with conditional imports rather than weakening the CLI package.
 
 ## Roadmap Snapshot
 
@@ -45,7 +46,8 @@ for prioritization and competitive notes.
 
 Near-term candidates:
 
-- `loghound doctor` for receiver, port, and package setup checks.
+- `loghound doctor` for collector health, writable root, and package setup
+  checks.
 - Safe retention and cleanup commands such as `loghound clean --older-than`.
 - Query and tail time-window parity, including `--until`.
 - Characterized read-path improvements for large JSONL files.

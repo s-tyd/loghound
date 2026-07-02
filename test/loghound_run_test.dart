@@ -1,42 +1,37 @@
 import 'dart:async';
-import 'dart:convert';
-import 'dart:io';
 
 import 'package:loghound/loghound.dart';
 import 'package:test/test.dart';
 
 void main() {
   group('LogHound.run', () {
-    late HttpServer server;
-    late List<Map<String, Object?>> received;
-    late Uri endpoint;
+    late List<LogHoundVmServiceEvent> events;
 
-    setUp(() async {
-      received = [];
-      server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
-      endpoint = Uri.parse(
-        'http://${server.address.address}:${server.port}/logs',
-      );
-      server.listen((request) async {
-        final body = await utf8.decoder.bind(request).join();
-        received.add(jsonDecode(body) as Map<String, Object?>);
-        request.response.statusCode = HttpStatus.noContent;
-        await request.response.close();
-      });
+    setUp(() {
+      events = [];
     });
 
-    tearDown(() async {
-      LogHound.dispose();
-      await server.close(force: true);
-    });
+    tearDown(LogHound.dispose);
+
+    List<Map<String, Object?>> records() {
+      return [
+        for (final event in events)
+          logHoundDecodeVmServiceEvent(event) ??
+              fail('invalid loghound event: ${event.kind} ${event.data}'),
+      ];
+    }
+
+    void captureEvent(String kind, Map<String, Object?> data) {
+      events.add(LogHoundVmServiceEvent(kind: kind, data: data));
+    }
 
     test('starts a session captures print and sends actions', () async {
       LogHound.run(
         appId: 'guide-app',
         flavor: 'staging',
         sessionId: 'session-1',
-        endpoint: endpoint,
         enabled: true,
+        postEvent: captureEvent,
         app: () {
           print('hello from app');
           LogHound.action('search.submit', data: {'query': 'ramen'});
@@ -45,6 +40,7 @@ void main() {
 
       await LogHound.flush();
 
+      final received = records();
       expect(received.map((record) => record['kind']), [
         'session',
         'log',
@@ -64,8 +60,8 @@ void main() {
         appId: 'guide-app',
         flavor: 'staging',
         sessionId: 'session-1',
-        endpoint: endpoint,
         enabled: true,
+        postEvent: captureEvent,
         app: () {
           scheduleMicrotask(() => throw StateError('boom'));
         },
@@ -74,10 +70,54 @@ void main() {
       await Future<void>.delayed(Duration.zero);
       await LogHound.flush();
 
+      final received = records();
       expect(received.where((record) => record['kind'] == 'error'), isNotEmpty);
       final error = received.last;
       expect(error, containsPair('name', 'Zone'));
       expect(error['error'], contains('boom'));
+    });
+
+    test('zone print handler uses the current configured session', () async {
+      final reconfiguredRecords = <Map<String, Object?>>[];
+
+      LogHound.run(
+        appId: 'guide-app',
+        flavor: 'staging',
+        sessionId: 'session-1',
+        enabled: true,
+        postEvent: captureEvent,
+        app: () {
+          scheduleMicrotask(() {
+            LogHound.configure(
+              LogHoundSession(
+                config: const LogHoundSessionConfig(
+                  appId: 'guide-app',
+                  flavor: 'staging',
+                  sessionId: 'session-2',
+                ),
+                sendRecord: reconfiguredRecords.add,
+              ),
+            );
+            print('after reconfigure');
+          });
+        },
+      );
+
+      await Future<void>.delayed(Duration.zero);
+      await LogHound.flush();
+
+      expect(
+        records().where((record) => record['message'] == 'after reconfigure'),
+        isEmpty,
+      );
+      expect(
+        reconfiguredRecords.single,
+        containsPair('session_id', 'session-2'),
+      );
+      expect(
+        reconfiguredRecords.single,
+        containsPair('message', 'after reconfigure'),
+      );
     });
 
     test('disabled mode runs the app without configuring LogHound', () async {
@@ -86,8 +126,8 @@ void main() {
       LogHound.run(
         appId: 'guide-app',
         flavor: 'staging',
-        endpoint: endpoint,
         enabled: false,
+        postEvent: captureEvent,
         app: () {
           ran = true;
           LogHound.action('search.submit');
@@ -97,30 +137,26 @@ void main() {
       await LogHound.flush();
 
       expect(ran, isTrue);
-      expect(received, isEmpty);
+      expect(events, isEmpty);
     });
 
-    test(
-      'endpoint is optional and transport failures do not break app',
-      () async {
-        await server.close(force: true);
-        var ran = false;
+    test('event sink failures do not break app', () async {
+      var ran = false;
 
-        LogHound.run(
-          appId: 'guide-app',
-          flavor: 'staging',
-          sessionId: 'session-1',
-          enabled: true,
-          timeout: const Duration(milliseconds: 50),
-          app: () {
-            ran = true;
-            LogHound.action('search.submit');
-          },
-        );
+      LogHound.run(
+        appId: 'guide-app',
+        flavor: 'staging',
+        sessionId: 'session-1',
+        enabled: true,
+        postEvent: (_, _) => throw StateError('VM service unavailable'),
+        app: () {
+          ran = true;
+          LogHound.action('search.submit');
+        },
+      );
 
-        await expectLater(LogHound.flush(), completes);
-        expect(ran, isTrue);
-      },
-    );
+      await expectLater(LogHound.flush(), completes);
+      expect(ran, isTrue);
+    });
   });
 }

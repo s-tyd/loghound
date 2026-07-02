@@ -3,19 +3,25 @@ import 'package:test/test.dart';
 
 void main() {
   test('public API uses LogHound word casing', () {
-    expect(LogHound.defaultEndpoint, 'http://127.0.0.1:8765/logs');
+    expect(LogHound.defaultVmServiceEventKind, logHoundVmServiceEventKind);
 
-    final client = LogHoundClient(Uri.parse('http://127.0.0.1:8765/logs'));
+    final client = LogHoundClient(postEvent: (_, _) {});
     client.close();
+    expect(logHoundVmServiceEventKind, 'loghound.log');
+    expect(
+      logHoundDecodeVmServiceEvent(
+        const LogHoundVmServiceEvent(
+          kind: logHoundVmServiceEventKind,
+          data: {'ok': true},
+        ),
+      ),
+      {'ok': true},
+    );
 
     final redactor = LogHoundRedactor();
     expect(redactor.redact({'token': 'secret'}), {'token': '***'});
 
     const query = LogHoundQuery();
     expect(query.filter(const []), isEmpty);
-
-    void acceptsReceiver(LogHoundReceiverServer? server) {}
-
-    acceptsReceiver(null);
   });
 }

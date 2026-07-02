@@ -1,49 +1,41 @@
 import 'dart:async';
-import 'dart:convert';
-import 'dart:io';
+import 'dart:developer' as developer;
 
 import 'json_safe.dart';
+import 'loghound_vm_service.dart';
 
-/// Fire-and-forget HTTP client for sending records to a loghound receiver.
+/// Fire-and-forget client for emitting structured records as VM Service events.
 class LogHoundClient {
-  /// Creates a client that posts JSON records to [endpoint].
-  LogHoundClient(
-    this.endpoint, {
-    this.timeout = const Duration(seconds: 2),
-    HttpClient? httpClient,
-  }) : _httpClient = httpClient ?? HttpClient(),
-       _closeClientOnClose = httpClient == null;
+  /// Creates a client that posts records to [postEvent].
+  LogHoundClient({
+    LogHoundVmServiceEventSink? postEvent,
+    this.eventKind = logHoundVmServiceEventKind,
+  }) : _postEvent = postEvent ?? developer.postEvent;
 
-  /// The receiver endpoint, usually `http://127.0.0.1:8765/logs`.
-  final Uri endpoint;
+  /// VM Service extension event kind used by this client.
+  final String eventKind;
 
-  /// Timeout used for each connection, write, and response drain.
-  final Duration timeout;
-  final HttpClient _httpClient;
-  final bool _closeClientOnClose;
-  Future<void> _pendingWrite = Future<void>.value();
+  final LogHoundVmServiceEventSink _postEvent;
 
-  /// Queues [record] for delivery and swallows transport failures.
+  /// Emits [record] as a VM Service extension event and swallows sink failures.
   void send(Map<String, Object?> record) {
-    final encoded = jsonEncode(loghoundJsonSafe(record));
-    _pendingWrite = _pendingWrite
-        .then((_) async {
-          final request = await _httpClient.postUrl(endpoint).timeout(timeout);
-          request.headers.contentType = ContentType.json;
-          request.write(encoded);
-          final response = await request.close().timeout(timeout);
-          await response.drain<void>().timeout(timeout);
-        })
-        .catchError((Object _) {});
-  }
-
-  /// Waits for all queued sends to finish.
-  Future<void> flush() => _pendingWrite;
-
-  /// Closes the owned HTTP client.
-  void close() {
-    if (_closeClientOnClose) {
-      _httpClient.close(force: true);
+    final safeRecord = loghoundJsonSafe(record);
+    if (safeRecord is! Map) {
+      return;
+    }
+    final eventData = safeRecord.map<String, Object?>(
+      (key, value) => MapEntry(key.toString(), value),
+    );
+    try {
+      _postEvent(eventKind, eventData);
+    } on Object {
+      // Development logging must not break the app.
     }
   }
+
+  /// Kept for API symmetry with async transports.
+  Future<void> flush() => Future<void>.value();
+
+  /// Kept for API symmetry with owned-resource transports.
+  void close() {}
 }

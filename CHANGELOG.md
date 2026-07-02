@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.0.2
+
+- Replace the local HTTP receiver capture path with hidden Dart VM Service
+  extension events for debug/profile Flutter sessions.
+- Add `loghound run` to start `flutter run`, auto-detect FVM Flutter SDKs,
+  collect VM Service events, and write routed JSONL records under `.loghound/`.
+- Add `loghound stay` for a background collector that can discover the active
+  Flutter VM Service and reconnect across app restarts.
+- Remove the old `serve`/receiver-oriented workflow and the related
+  `LOGHOUND_URL`, `loghound.env`, and device binding setup.
+- Route records to `.loghound/<flavor>/<platform>/sessions/<session_id>.jsonl`,
+  `.loghound/<flavor>/<platform>/latest.jsonl`, and `.loghound/catalog.jsonl`.
+- Read legacy `loghound/` roots when `.loghound/` does not exist, so existing
+  sessions and settings remain discoverable during migration.
+- Make `query`, `tail`, `latest-error`, `context`, `actions`, `http`, `body`,
+  and `stats` read routed `.loghound/` sessions by default; `--file` now opts
+  into a single JSONL file explicitly.
+- Keep CLI-side redaction for VM Service collection before records are
+  persisted.
+- Add `loghound run --flavor` and `--dart-define-from-file` passthrough for
+  common Flutter launch setups.
+- Add built-in Dio support through `LogHoundDioInterceptor`, with opt-in HTTP
+  request/response body capture settings.
+- `loghound setting` with no subcommand now prints one structured JSON
+  record per setting (key/label/description/type/value/default/command)
+  instead of a single flat object; in an interactive terminal it opens a
+  navigable list (↑↓ move, space toggles and saves, →/enter expands the
+  description, q/Esc quits).
+- Add `language` (en/ja) and `context_format` (markdown/jsonl) settings; the
+  interactive `loghound setting` list edits enums by cycling with space,
+  localizes to the language setting, and colorizes on a capable terminal.
+  `loghound context` uses `context_format` as its default when `--format`
+  is not given. NDJSON output stays English and uncolored.
+- Add `capture_http_request_body` and `capture_http_response_body` settings so
+  agents can tell whether HTTP body logging is intentionally enabled.
+- Restore non-interactive `loghound setting <key> <value>` writes and reject
+  unknown setting keys with a non-zero exit.
+- Harden CLI failures for missing Flutter executables, VM Service connection
+  errors, malformed settings files, malformed stdin bytes, and interactive
+  setting write failures.
+
 ## 0.0.1
 
 - Rename package and CLI to loghound.

@@ -4,22 +4,63 @@ import 'dart:io' as io;
 import 'dart:math' as math;
 
 import 'package:args/args.dart';
+import 'package:vm_service/vm_service.dart';
+import 'package:vm_service/vm_service_io.dart';
 
 import 'banner.dart';
 import 'json_safe.dart';
 import 'jsonl_log_store.dart';
 import 'log_query.dart';
 import 'loghound_directory_store.dart';
-import 'log_receiver_server.dart';
+import 'loghound_settings.dart';
+import 'loghound_vm_service.dart';
+import 'redactor.dart';
+import 'setting_interactive.dart';
+
+const _defaultLogRoot = '.loghound';
+const _legacyLogRoot = 'loghound';
+const _defaultVmServiceUriFile = '.dart_tool/loghound/vm-service-url';
+
+/// Starts a subprocess and returns its eventual exit code.
+typedef LogHoundProcessRunner =
+    Future<int> Function(
+      String executable,
+      List<String> arguments, {
+      String? workingDirectory,
+    });
+
+/// Starts a subprocess and returns the running process.
+typedef LogHoundProcessStarter =
+    Future<io.Process> Function(
+      String executable,
+      List<String> arguments, {
+      String? workingDirectory,
+    });
+
+/// Creates a stream of VM Service extension events for one VM Service URI.
+typedef LogHoundVmServiceEventFactory =
+    Stream<LogHoundVmServiceEvent> Function(
+      String serviceUri, {
+      required StringSink errors,
+      required bool resumeOnListen,
+    });
 
 /// Runs the `loghound` command-line interface.
 Future<int> runLogHoundCli(
   List<String> args, {
   StringSink? out,
   StringSink? err,
+  Stream<LogHoundVmServiceEvent>? vmServiceEvents,
+  io.Directory? currentDirectory,
+  LogHoundProcessRunner? processRunner,
+  LogHoundProcessStarter? processStarter,
+  LogHoundVmServiceEventFactory? vmServiceEventFactory,
+  int? maxVmServiceConnections,
+  Duration? vmServiceUriFileTimeout,
 }) async {
   final output = out ?? io.stdout;
   final errors = err ?? io.stderr;
+  final workingDirectory = currentDirectory ?? io.Directory.current;
   final parser = _buildParser();
 
   late ArgResults results;
@@ -32,9 +73,14 @@ Future<int> runLogHoundCli(
   }
 
   final command = results.command;
-  if (command == null || results['help'] == true) {
+  if (results['help'] == true || (command == null && args.isEmpty)) {
     output.writeln(_usage(parser));
     return 0;
+  }
+  if (command == null) {
+    errors.writeln('Unknown command: ${args.first}');
+    errors.writeln(_usage(parser));
+    return 64;
   }
 
   switch (command.name) {
@@ -42,6 +88,29 @@ Future<int> runLogHoundCli(
       return _runApps(command, output);
     case 'sessions':
       return _runSessions(command, output);
+    case 'stay':
+      return _runStay(
+        command,
+        output,
+        errors,
+        workingDirectory,
+        vmServiceEvents,
+        processStarter ?? _defaultProcessStarter,
+        vmServiceEventFactory: vmServiceEventFactory,
+        maxVmServiceConnections: maxVmServiceConnections,
+        vmServiceUriFileTimeout: vmServiceUriFileTimeout,
+      );
+    case 'run':
+      return _runRun(
+        command,
+        output,
+        errors,
+        workingDirectory,
+        processRunner ?? _defaultProcessRunner,
+        vmServiceEvents,
+        vmServiceEventFactory: vmServiceEventFactory,
+        vmServiceUriFileTimeout: vmServiceUriFileTimeout,
+      );
     case 'query':
       return _runQuery(command, output);
     case 'tail':
@@ -58,10 +127,10 @@ Future<int> runLogHoundCli(
       return _runBody(command, output, errors);
     case 'stats':
       return _runStats(command, output);
-    case 'serve':
-      return _runServe(command, output);
-    case 'stay':
-      return _runStay(command, output);
+    case 'doctor':
+      return _runDoctor(command, output);
+    case 'setting':
+      return _runSetting(command, output, errors);
     default:
       errors.writeln('Unknown command: ${command.name}');
       errors.writeln(_usage(parser));
@@ -72,8 +141,13 @@ Future<int> runLogHoundCli(
 ArgParser _buildParser() {
   return ArgParser()
     ..addFlag('help', abbr: 'h', negatable: false, help: 'Show help.')
-    ..addCommand('apps', ArgParser()..addOption('root', defaultsTo: 'loghound'))
+    ..addCommand(
+      'apps',
+      ArgParser()..addOption('root', defaultsTo: _defaultLogRoot),
+    )
     ..addCommand('sessions', _withRouteOptions(ArgParser(), includeFile: false))
+    ..addCommand('stay', _buildStayParser())
+    ..addCommand('run', _buildRunParser())
     ..addCommand(
       'query',
       _withRouteOptions(
@@ -141,27 +215,73 @@ ArgParser _buildParser() {
     )
     ..addCommand('stats', _withRouteOptions(ArgParser()))
     ..addCommand(
-      'serve',
-      ArgParser()
-        ..addOption('host', defaultsTo: '127.0.0.1')
-        ..addOption('port', defaultsTo: '8765')
-        ..addOption('out', defaultsTo: 'loghound/app.jsonl'),
+      'doctor',
+      _withRouteOptions(
+        ArgParser()..addOption(
+          'max-age-minutes',
+          help: 'Warn when the latest record is older than this many minutes.',
+        ),
+        includeFile: false,
+      ),
     )
-    ..addCommand(
-      'stay',
-      ArgParser()
-        ..addOption('host', defaultsTo: '127.0.0.1')
-        ..addOption('port', defaultsTo: '8765')
-        ..addOption('root', defaultsTo: 'loghound'),
-    );
+    ..addCommand('setting', _buildSettingParser());
+}
+
+ArgParser _buildStayParser() {
+  return ArgParser()
+    ..addOption('root', defaultsTo: _defaultLogRoot)
+    ..addOption('device', abbr: 'd', help: 'Flutter device id/name.')
+    ..addOption(
+      'app-id',
+      help: 'Flutter app id/bundle id used by flutter attach.',
+    )
+    ..addOption(
+      'flutter',
+      help: 'Flutter executable. Defaults to .fvm/flutter_sdk/bin/flutter.',
+    )
+    ..addOption(
+      'vm-service-uri',
+      help: 'Dart VM Service URI. Usually written by loghound run.',
+    )
+    ..addOption(
+      'vm-service-uri-file',
+      help: 'File containing a Dart VM Service URI.',
+    )
+    ..addOption('event-kind', defaultsTo: logHoundVmServiceEventKind);
+}
+
+ArgParser _buildRunParser() {
+  return ArgParser(allowTrailingOptions: false)
+    ..addOption('root', defaultsTo: _defaultLogRoot)
+    ..addOption('device', abbr: 'd', help: 'Flutter device id/name.')
+    ..addOption('flavor', help: 'Flutter flavor to pass to flutter run.')
+    ..addMultiOption(
+      'dart-define-from-file',
+      help: 'Pass --dart-define-from-file to flutter run.',
+      valueHelp: 'path',
+    )
+    ..addOption(
+      'flutter',
+      help: 'Flutter executable. Defaults to .fvm/flutter_sdk/bin/flutter.',
+    )
+    ..addOption(
+      'vm-service-uri-file',
+      defaultsTo: _defaultVmServiceUriFile,
+      help: 'File where flutter run writes its VM Service URI.',
+    )
+    ..addOption('event-kind', defaultsTo: logHoundVmServiceEventKind);
+}
+
+ArgParser _buildSettingParser() {
+  return ArgParser()..addOption('root', defaultsTo: _defaultLogRoot);
 }
 
 ArgParser _withRouteOptions(ArgParser parser, {bool includeFile = true}) {
   if (includeFile) {
-    parser.addOption('file', abbr: 'f', defaultsTo: 'loghound/app.jsonl');
+    parser.addOption('file', abbr: 'f');
   }
   return parser
-    ..addOption('root', defaultsTo: 'loghound')
+    ..addOption('root', defaultsTo: _defaultLogRoot)
     ..addOption('app')
     ..addOption('flavor')
     ..addOption('platform')
@@ -170,7 +290,7 @@ ArgParser _withRouteOptions(ArgParser parser, {bool includeFile = true}) {
 
 Future<int> _runApps(ArgResults command, StringSink output) async {
   final apps = await LogHoundDirectoryStore(
-    io.Directory(command['root'] as String),
+    _readRootDirectory(command['root'] as String),
   ).apps();
   for (final app in apps) {
     _writeRecord(output, app.toJson());
@@ -181,7 +301,7 @@ Future<int> _runApps(ArgResults command, StringSink output) async {
 Future<int> _runSessions(ArgResults command, StringSink output) async {
   final sessions =
       await LogHoundDirectoryStore(
-        io.Directory(command['root'] as String),
+        _readRootDirectory(command['root'] as String),
       ).sessions(
         appId: command['app'] as String?,
         flavor: command['flavor'] as String?,
@@ -191,6 +311,299 @@ Future<int> _runSessions(ArgResults command, StringSink output) async {
     _writeRecord(output, session.toJson());
   }
   return 0;
+}
+
+Future<int> _runStay(
+  ArgResults command,
+  StringSink output,
+  StringSink errors,
+  io.Directory currentDirectory,
+  Stream<LogHoundVmServiceEvent>? injectedEvents,
+  LogHoundProcessStarter processStarter, {
+  LogHoundVmServiceEventFactory? vmServiceEventFactory,
+  int? maxVmServiceConnections,
+  Duration? vmServiceUriFileTimeout,
+}) async {
+  final resolution = await _resolveStayVmServiceUri(
+    command,
+    currentDirectory,
+    processStarter,
+    timeout: vmServiceUriFileTimeout ?? const Duration(seconds: 60),
+    errors: errors,
+  );
+  if (resolution?.exitCode case final exitCode? when exitCode != 0) {
+    return exitCode;
+  }
+  final serviceUri = resolution?.uri;
+  if (serviceUri == null && injectedEvents == null) {
+    return 64;
+  }
+
+  try {
+    return await _collectVmServiceEvents(
+      rootPath: command['root'] as String,
+      serviceUri: serviceUri,
+      eventKind: command['event-kind'] as String,
+      output: output,
+      errors: errors,
+      injectedEvents: injectedEvents,
+      vmServiceEventFactory: vmServiceEventFactory,
+      keepAlive: injectedEvents == null,
+      maxConnections: maxVmServiceConnections,
+    );
+  } finally {
+    resolution?.dispose();
+  }
+}
+
+Future<int> _runRun(
+  ArgResults command,
+  StringSink output,
+  StringSink errors,
+  io.Directory currentDirectory,
+  LogHoundProcessRunner processRunner,
+  Stream<LogHoundVmServiceEvent>? injectedEvents, {
+  LogHoundVmServiceEventFactory? vmServiceEventFactory,
+  Duration? vmServiceUriFileTimeout,
+}) async {
+  final uriFile = io.File(
+    _resolvePath(currentDirectory, command['vm-service-uri-file'] as String),
+  );
+  await uriFile.parent.create(recursive: true);
+  if (await uriFile.exists()) {
+    await uriFile.delete();
+  }
+
+  final flutterExecutable =
+      command['flutter'] as String? ??
+      resolveFlutterExecutable(currentDirectory);
+  final flutterArgs = <String>[
+    'run',
+    if ((command['device'] as String?)?.isNotEmpty == true) ...[
+      '-d',
+      command['device'] as String,
+    ],
+    if ((command['flavor'] as String?)?.isNotEmpty == true) ...[
+      '--flavor',
+      command['flavor'] as String,
+    ],
+    for (final path in command['dart-define-from-file'] as List<String>)
+      if (path.isNotEmpty) '--dart-define-from-file=$path',
+    '--start-paused',
+    '--vmservice-out-file=${uriFile.path}',
+    ...command.rest,
+  ];
+
+  final Future<int> flutterExit;
+  try {
+    flutterExit =
+        processRunner(
+          flutterExecutable,
+          flutterArgs,
+          workingDirectory: currentDirectory.path,
+        ).catchError((Object error) {
+          errors.writeln('Failed to start Flutter: $error');
+          return 1;
+        });
+  } on Object catch (error) {
+    errors.writeln('Failed to start Flutter: $error');
+    return 1;
+  }
+
+  final uriErrors = StringBuffer();
+  final startup =
+      await Future.any<({String kind, String? serviceUri, int? exitCode})>([
+        _resolveVmServiceUri(
+          explicitUri: null,
+          uriFilePath: uriFile.path,
+          currentDirectory: currentDirectory,
+          timeout: vmServiceUriFileTimeout ?? const Duration(seconds: 60),
+          errors: uriErrors,
+        ).then((uri) => (kind: 'uri', serviceUri: uri, exitCode: null)),
+        flutterExit.then(
+          (exitCode) => (kind: 'exit', serviceUri: null, exitCode: exitCode),
+        ),
+      ]);
+  if (startup.kind == 'exit') {
+    final exitCode = startup.exitCode!;
+    if (exitCode != 0) {
+      return exitCode;
+    }
+    final fallbackUri = await _resolveVmServiceUri(
+      explicitUri: null,
+      uriFilePath: uriFile.path,
+      currentDirectory: currentDirectory,
+      timeout: Duration.zero,
+      errors: StringBuffer(),
+    );
+    if (fallbackUri == null) {
+      return exitCode;
+    }
+    final collectExit = await _collectVmServiceEvents(
+      rootPath: command['root'] as String,
+      serviceUri: fallbackUri,
+      eventKind: command['event-kind'] as String,
+      output: output,
+      errors: errors,
+      injectedEvents: injectedEvents,
+      vmServiceEventFactory: vmServiceEventFactory,
+      resumeOnListen: true,
+    );
+    if (collectExit != 0) {
+      return collectExit;
+    }
+    return exitCode;
+  }
+
+  final serviceUri = startup.serviceUri;
+  if (serviceUri == null) {
+    errors.write(uriErrors.toString());
+    return 64;
+  }
+
+  final collectExit = await _collectVmServiceEvents(
+    rootPath: command['root'] as String,
+    serviceUri: serviceUri,
+    eventKind: command['event-kind'] as String,
+    output: output,
+    errors: errors,
+    injectedEvents: injectedEvents,
+    vmServiceEventFactory: vmServiceEventFactory,
+    resumeOnListen: true,
+  );
+  final runExit = await flutterExit;
+  if (collectExit != 0) {
+    return collectExit;
+  }
+  return runExit;
+}
+
+Future<int> _collectVmServiceEvents({
+  required String rootPath,
+  required String? serviceUri,
+  required String eventKind,
+  required StringSink output,
+  required StringSink errors,
+  required Stream<LogHoundVmServiceEvent>? injectedEvents,
+  LogHoundVmServiceEventFactory? vmServiceEventFactory,
+  bool resumeOnListen = false,
+  bool keepAlive = false,
+  int? maxConnections,
+}) async {
+  if ((serviceUri == null || serviceUri.trim().isEmpty) &&
+      injectedEvents == null) {
+    errors.writeln('Missing required option: --vm-service-uri');
+    return 64;
+  }
+
+  final trimmedServiceUri = serviceUri?.trim();
+  final store = LogHoundDirectoryStore(io.Directory(rootPath));
+  final eventFactory = vmServiceEventFactory ?? _vmServiceEvents;
+  var records = 0;
+  var ignored = 0;
+  var connections = 0;
+  final redactor = LogHoundRedactor();
+
+  while (true) {
+    connections++;
+    try {
+      final events =
+          injectedEvents ??
+          eventFactory(
+            trimmedServiceUri!,
+            errors: errors,
+            resumeOnListen: resumeOnListen,
+          );
+
+      await for (final event in events) {
+        final record = logHoundDecodeVmServiceEvent(
+          event,
+          eventKind: eventKind,
+        );
+        if (record == null) {
+          ignored++;
+          continue;
+        }
+        await store.append(_redactRecord(record, redactor));
+        records++;
+      }
+    } on Object catch (error) {
+      errors.writeln('VM Service connection failed: $error');
+      if (!keepAlive) {
+        return 1;
+      }
+    }
+
+    if (injectedEvents != null || !keepAlive) {
+      break;
+    }
+    if (maxConnections != null && connections >= maxConnections) {
+      break;
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 250));
+  }
+
+  final result = <String, Object?>{
+    'root': rootPath,
+    'records': records,
+    'ignored': ignored,
+  };
+  if (trimmedServiceUri != null && trimmedServiceUri.isNotEmpty) {
+    result['vm_service_uri'] = trimmedServiceUri;
+  }
+
+  _writeRecord(output, result);
+  return 0;
+}
+
+Map<String, Object?> _redactRecord(
+  Map<String, Object?> record,
+  LogHoundRedactor redactor,
+) {
+  return redactor.redact(record) as Map<String, Object?>;
+}
+
+Stream<LogHoundVmServiceEvent> _vmServiceEvents(
+  String serviceUri, {
+  required StringSink errors,
+  bool resumeOnListen = false,
+}) async* {
+  final wsUri = logHoundVmServiceWebSocketUri(serviceUri).toString();
+  final service = await vmServiceConnectUri(wsUri);
+  try {
+    await service.streamListen(EventStreams.kExtension);
+    if (resumeOnListen) {
+      await _resumeMainIsolate(service, errors);
+    }
+    errors.writeln('loghound collecting from $serviceUri');
+    await for (final event in service.onExtensionEvent) {
+      yield LogHoundVmServiceEvent(
+        kind: event.extensionKind,
+        data: event.extensionData?.data,
+      );
+    }
+  } finally {
+    await service.dispose();
+  }
+}
+
+Future<void> _resumeMainIsolate(VmService service, StringSink errors) async {
+  try {
+    final vm = await service.getVM();
+    final isolates = vm.isolates ?? const <IsolateRef>[];
+    final isolate = isolates
+        .where((isolate) => isolate.isSystemIsolate != true)
+        .where((isolate) => isolate.id != null && isolate.id!.isNotEmpty)
+        .firstOrNull;
+    final isolateId = isolate?.id;
+    if (isolateId == null) {
+      errors.writeln('No app isolate found to resume.');
+      return;
+    }
+    await service.resume(isolateId);
+  } on Object catch (error) {
+    errors.writeln('Failed to resume paused app isolate: $error');
+  }
 }
 
 Future<int> _runQuery(ArgResults command, StringSink output) async {
@@ -263,7 +676,12 @@ Future<int> _runContext(ArgResults command, StringSink output) async {
     maxLines,
   );
   final omitted = window.length - related.length;
-  final format = command['format'] as String;
+  final settings = await LogHoundSettingsStore(
+    _readRootDirectory(command['root'] as String),
+  ).read();
+  final format = command.wasParsed('format')
+      ? command['format'] as String
+      : settings.contextFormat;
   final text = switch (format) {
     'jsonl' => _formatJsonLines(related),
     _ => _formatMarkdownContext(
@@ -404,73 +822,585 @@ Future<int> _runStats(ArgResults command, StringSink output) async {
   return 0;
 }
 
-Future<int> _runServe(ArgResults command, StringSink output) async {
-  final host = command['host'] as String;
-  final port = int.parse(command['port'] as String);
-  final outputPath = command['out'] as String;
-  final store = JsonlLogStore(io.File(outputPath));
-  final server = await LogHoundReceiverServer.start(
-    address: io.InternetAddress(host),
-    port: port,
-    store: store,
-  );
-
-  _writeBanner(output);
-  output
-    ..writeln('Listening on ${server.uri.resolve('/logs')}')
-    ..writeln('Writing logs to $outputPath');
-
-  final stop = Completer<void>();
-  io.ProcessSignal.sigint.watch().listen((_) {
-    if (!stop.isCompleted) {
-      stop.complete();
-    }
-  });
-  await stop.future;
-  await server.close();
-  return 0;
-}
-
-Future<int> _runStay(ArgResults command, StringSink output) async {
-  final host = command['host'] as String;
-  final port = int.parse(command['port'] as String);
+Future<int> _runDoctor(ArgResults command, StringSink output) async {
   final rootPath = command['root'] as String;
-  final directoryStore = LogHoundDirectoryStore(io.Directory(rootPath));
-  final server = await LogHoundReceiverServer.start(
-    address: io.InternetAddress(host),
-    port: port,
-    store: JsonlLogStore(io.File('$rootPath/.receiver.jsonl')),
-    onRecord: directoryStore.append,
-  );
+  final directoryStore = LogHoundDirectoryStore(_readRootDirectory(rootPath));
+  final sessionFilter = command['session'] as String?;
+  final sessions =
+      (await directoryStore.sessions(
+        appId: command['app'] as String?,
+        flavor: command['flavor'] as String?,
+        platform: command['platform'] as String?,
+      )).where((session) {
+        return sessionFilter == null ||
+            sessionFilter.isEmpty ||
+            session.sessionId == sessionFilter;
+      }).toList();
 
-  _writeBanner(output);
-  output
-    ..writeln('Listening on ${server.uri.resolve('/logs')}')
-    ..writeln('Routing logs under $rootPath');
+  final issues = <Map<String, Object?>>[];
+  final records = <Map<String, Object?>>[];
+  for (final session in sessions) {
+    records.addAll(await JsonlLogStore(session.file).readAll());
+  }
+  records.sort(_compareRecordsByTimestamp);
 
-  final stop = Completer<void>();
-  io.ProcessSignal.sigint.watch().listen((_) {
-    if (!stop.isCompleted) {
-      stop.complete();
+  if (sessions.isEmpty) {
+    issues.add({
+      'severity': 'error',
+      'code': 'no_sessions',
+      'message': 'No loghound sessions were found for the selected route.',
+    });
+  } else if (records.isEmpty) {
+    issues.add({
+      'severity': 'error',
+      'code': 'no_records',
+      'message': 'Sessions exist, but no records were readable.',
+    });
+  }
+
+  final byKind = <String, int>{};
+  var screenRecords = 0;
+  var actionRecords = 0;
+  var httpRecords = 0;
+  var errorRecords = 0;
+  var httpBodyRecords = 0;
+  for (final record in records) {
+    final kind = _recordKind(record);
+    byKind[kind] = (byKind[kind] ?? 0) + 1;
+    if (kind == 'screen') {
+      screenRecords++;
+    } else if (kind == 'action') {
+      actionRecords++;
+    } else if (kind == 'http') {
+      httpRecords++;
+      if (_requestBody(record) != null || _responseBody(record) != null) {
+        httpBodyRecords++;
+      }
+    } else if (kind == 'error') {
+      errorRecords++;
     }
-  });
-  await stop.future;
-  await server.close();
-  return 0;
+  }
+
+  if (records.isNotEmpty) {
+    if (screenRecords == 0) {
+      issues.add({
+        'severity': 'warning',
+        'code': 'no_screen_records',
+        'message': 'No screen records were found; route context may be weak.',
+      });
+    }
+    if (actionRecords == 0) {
+      issues.add({
+        'severity': 'warning',
+        'code': 'no_action_records',
+        'message':
+            'No action records were found; user intent context may be weak.',
+      });
+    }
+    if (httpRecords == 0) {
+      issues.add({
+        'severity': 'warning',
+        'code': 'no_http_records',
+        'message':
+            'No HTTP records were found; API investigation will be limited.',
+      });
+    } else if (httpBodyRecords == 0) {
+      issues.add({
+        'severity': 'warning',
+        'code': 'no_http_bodies',
+        'message':
+            'HTTP records exist, but request/response bodies are not captured.',
+      });
+    }
+  }
+
+  final latestRecordAt = records.isEmpty
+      ? null
+      : _recordTimestamp(records.last);
+  final maxAgeMinutes = _optionalInt(command['max-age-minutes'] as String?);
+  if (latestRecordAt != null && maxAgeMinutes != null) {
+    final age = DateTime.now().difference(latestRecordAt).inMinutes;
+    if (age > maxAgeMinutes) {
+      issues.add({
+        'severity': 'warning',
+        'code': 'stale_records',
+        'message': 'Latest record is older than $maxAgeMinutes minute(s).',
+        'age_minutes': age,
+      });
+    }
+  }
+
+  final hasErrors = issues.any((issue) => issue['severity'] == 'error');
+  final hasWarnings = issues.any((issue) => issue['severity'] == 'warning');
+  final status = hasErrors ? 'fail' : (hasWarnings ? 'warn' : 'ok');
+  final latestSession = sessions.isEmpty ? null : sessions.first.toJson();
+
+  final report = <String, Object?>{
+    'root': rootPath,
+    'status': status,
+    'ok': status == 'ok',
+    'sessions': sessions.length,
+    'records': records.length,
+    'screen_records': screenRecords,
+    'action_records': actionRecords,
+    'http_records': httpRecords,
+    'error_records': errorRecords,
+    'http_body_records': httpBodyRecords,
+    'by_kind': byKind,
+    if (latestRecordAt != null)
+      'latest_record_at': latestRecordAt.toIso8601String(),
+    'issues': issues,
+  };
+  if (latestSession != null) {
+    report['latest_session'] = latestSession;
+  }
+
+  _writeRecord(output, report);
+  return hasErrors ? 1 : 0;
 }
 
-void _writeBanner(StringSink output) {
-  output
-    ..writeln()
-    ..writeln(logHoundBanner(color: _stdoutWantsColor()))
-    ..writeln();
+Future<int> _runSetting(
+  ArgResults command,
+  StringSink output,
+  StringSink errors,
+) async {
+  final rootPath = command['root'] as String;
+  final store = LogHoundSettingsStore(_readRootDirectory(rootPath));
+  var settings = await store.read();
+  final rest = command.rest;
+
+  if (rest.isNotEmpty) {
+    if (rest.length != 2) {
+      errors.writeln('Usage: loghound setting <key> <value>');
+      return 64;
+    }
+    final key = rest[0];
+    final descriptor = _settingDescriptorByKey(key);
+    if (descriptor == null) {
+      errors.writeln('Unknown setting: $key');
+      return 64;
+    }
+    final value = _parseSettingValue(descriptor, rest[1]);
+    if (value == null) {
+      errors.writeln(
+        'Invalid value for $key: ${rest[1]}'
+        '${descriptor.options == null ? '' : ' (expected ${descriptor.options!.join('|')})'}',
+      );
+      return 64;
+    }
+    settings = descriptor.applyValue(settings, value);
+    await store.write(settings);
+    final record = settings
+        .toSettingRecords(language: settings.language)
+        .singleWhere((record) => record['key'] == key);
+    _writeRecord(output, record);
+    return 0;
+  }
+
+  final subcommand = command.command;
+
+  if (subcommand == null) {
+    if (io.stdin.hasTerminal && io.stdout.hasTerminal) {
+      await runSettingInteractive(
+        store: store,
+        initialSettings: settings,
+        stdin: io.stdin,
+        stdout: io.stdout,
+        color: logHoundShouldColor(
+          hasTerminal: io.stdout.hasTerminal,
+          supportsAnsi: io.stdout.supportsAnsiEscapes,
+          environment: io.Platform.environment,
+        ),
+      );
+      return 0;
+    }
+    _writeRecords(output, settings.toSettingRecords());
+    return 0;
+  }
+
+  errors.writeln('Unknown setting: ${subcommand.name}');
+  return 64;
 }
 
-bool _stdoutWantsColor() => logHoundShouldColor(
-  hasTerminal: io.stdout.hasTerminal,
-  supportsAnsi: io.stdout.supportsAnsiEscapes,
-  environment: io.Platform.environment,
-);
+LogHoundSettingDescriptor? _settingDescriptorByKey(String key) {
+  for (final descriptor in logHoundSettingDescriptors) {
+    if (descriptor.key == key) {
+      return descriptor;
+    }
+  }
+  return null;
+}
+
+Object? _parseSettingValue(LogHoundSettingDescriptor descriptor, String value) {
+  if (descriptor.options case final options?) {
+    return options.contains(value) ? value : null;
+  }
+  return switch (value.toLowerCase()) {
+    'true' || 'on' || 'yes' => true,
+    'false' || 'off' || 'no' => false,
+    _ => null,
+  };
+}
+
+/// Runs the interactive `loghound setting` list on a real terminal.
+///
+/// Puts [stdin] into raw mode, draws the localized setting list, and loops
+/// on keypresses: arrows move the selection, space advances the selected
+/// setting's value and persists it through [store], right/enter expands a
+/// description, and q/Esc exits. Rows colorize when [color] is true.
+/// Terminal modes are always restored.
+Future<void> runSettingInteractive({
+  required LogHoundSettingsStore store,
+  required LogHoundSettings initialSettings,
+  required io.Stdin stdin,
+  required io.Stdout stdout,
+  required bool color,
+}) async {
+  final priorEcho = stdin.echoMode;
+  final priorLine = stdin.lineMode;
+  var settings = initialSettings;
+  var state = SettingInteractiveState(
+    records: settings.toSettingRecords(language: settings.language),
+    selectedIndex: 0,
+    expandedKeys: const <String>{},
+    language: settings.language,
+  );
+  var priorLines = 0;
+
+  void draw() {
+    final frame = renderSettingInteractiveList(state, color: color);
+    if (priorLines > 0) {
+      stdout.write('\x1b[${priorLines}A\x1b[0J');
+    }
+    stdout.write(frame);
+    priorLines = '\n'.allMatches(frame).length;
+  }
+
+  var restored = false;
+  void restore() {
+    if (restored) {
+      return;
+    }
+    restored = true;
+    stdout.write('\x1b[?25h');
+    stdin.echoMode = priorEcho;
+    stdin.lineMode = priorLine;
+  }
+
+  final done = Completer<void>();
+  late StreamSubscription<List<int>> subscription;
+
+  Future<void> handle(List<int> bytes) async {
+    final result = handleSettingInteractiveKey(
+      state,
+      decodeSettingInteractiveKey(bytes),
+    );
+    state = result.state;
+
+    final advanceKey = result.advanceKey;
+    if (advanceKey != null) {
+      final descriptor = logHoundSettingDescriptors.firstWhere(
+        (candidate) => candidate.key == advanceKey,
+      );
+      settings = logHoundAdvanceSetting(descriptor, settings);
+      await store.write(settings);
+      state = state.copyWith(
+        records: settings.toSettingRecords(language: settings.language),
+        language: settings.language,
+      );
+    }
+
+    draw();
+    if (result.quit) {
+      // Restore terminal modes while stdin is still open: cancelling the
+      // subscription closes fd 0, so a later restore would throw a
+      // StdinException.
+      restore();
+      await subscription.cancel();
+      if (!done.isCompleted) {
+        done.complete();
+      }
+    }
+  }
+
+  Future<void> handleSafely(List<int> bytes) async {
+    try {
+      await handle(bytes);
+    } on Object catch (error, stackTrace) {
+      restore();
+      await subscription.cancel();
+      if (!done.isCompleted) {
+        done.completeError(error, stackTrace);
+      }
+    }
+  }
+
+  try {
+    stdin.echoMode = false;
+    stdin.lineMode = false;
+    stdout.write('\x1b[?25l');
+    draw();
+
+    // Serialize keypresses: pause until each async handler finishes so a
+    // fast burst of input cannot interleave value writes.
+    subscription = stdin.listen(
+      (bytes) => subscription.pause(handleSafely(bytes)),
+      onDone: () {
+        restore();
+        if (!done.isCompleted) {
+          done.complete();
+        }
+      },
+    );
+
+    await done.future;
+  } finally {
+    restore();
+  }
+}
+
+/// Resolves the Flutter executable for a project directory.
+///
+/// FVM projects are detected through `.fvm/flutter_sdk/bin/flutter`; otherwise
+/// the executable name `flutter` is returned so the user's PATH is used.
+String resolveFlutterExecutable(
+  io.Directory projectDirectory, {
+  bool? isWindows,
+}) {
+  final executable = (isWindows ?? io.Platform.isWindows)
+      ? 'flutter.bat'
+      : 'flutter';
+  final fvmFlutter = io.File(
+    [
+      projectDirectory.path,
+      '.fvm',
+      'flutter_sdk',
+      'bin',
+      executable,
+    ].join(io.Platform.pathSeparator),
+  );
+  if (fvmFlutter.existsSync()) {
+    return fvmFlutter.path;
+  }
+  return executable;
+}
+
+Future<int> _defaultProcessRunner(
+  String executable,
+  List<String> arguments, {
+  String? workingDirectory,
+}) async {
+  final process = await io.Process.start(
+    executable,
+    arguments,
+    workingDirectory: workingDirectory,
+    mode: io.ProcessStartMode.inheritStdio,
+  );
+  return process.exitCode;
+}
+
+Future<io.Process> _defaultProcessStarter(
+  String executable,
+  List<String> arguments, {
+  String? workingDirectory,
+}) {
+  return io.Process.start(
+    executable,
+    arguments,
+    workingDirectory: workingDirectory,
+  );
+}
+
+Future<_VmServiceUriResolution?> _resolveStayVmServiceUri(
+  ArgResults command,
+  io.Directory currentDirectory,
+  LogHoundProcessStarter processStarter, {
+  required Duration timeout,
+  required StringSink errors,
+}) async {
+  if (command.wasParsed('vm-service-uri') ||
+      command.wasParsed('vm-service-uri-file')) {
+    final explicitUri = await _resolveVmServiceUri(
+      explicitUri: command['vm-service-uri'] as String?,
+      uriFilePath: command.wasParsed('vm-service-uri-file')
+          ? command['vm-service-uri-file'] as String?
+          : null,
+      currentDirectory: currentDirectory,
+      timeout: timeout,
+      errors: errors,
+    );
+    if (explicitUri != null) {
+      return _VmServiceUriResolution(explicitUri);
+    }
+    return null;
+  }
+
+  final flutterExecutable =
+      command['flutter'] as String? ??
+      resolveFlutterExecutable(currentDirectory);
+  final attachArgs = <String>[
+    'attach',
+    '--machine',
+    if ((command['device'] as String?)?.isNotEmpty == true) ...[
+      '-d',
+      command['device'] as String,
+    ],
+    if ((command['app-id'] as String?)?.isNotEmpty == true) ...[
+      '--app-id',
+      command['app-id'] as String,
+    ],
+  ];
+
+  late final io.Process process;
+  try {
+    process = await processStarter(
+      flutterExecutable,
+      attachArgs,
+      workingDirectory: currentDirectory.path,
+    );
+  } on Object catch (error) {
+    errors.writeln('Failed to start Flutter: $error');
+    return _VmServiceUriResolution.failure(1);
+  }
+  unawaited(process.stderr.drain<void>());
+
+  try {
+    final uri = await process.stdout
+        .transform(utf8.decoder)
+        .transform(const LineSplitter())
+        .map(_vmServiceUriFromFlutterAttachLine)
+        .where((uri) => uri != null)
+        .cast<String>()
+        .first
+        .timeout(timeout);
+    return _VmServiceUriResolution(uri, process: process);
+  } on Object catch (error) {
+    process.kill();
+    if (error is TimeoutException) {
+      errors.writeln('Timed out waiting for flutter attach VM Service URI.');
+    } else {
+      errors.writeln('Failed to discover VM Service URI from flutter attach.');
+    }
+    return _VmServiceUriResolution.failure(1);
+  }
+}
+
+String? _vmServiceUriFromFlutterAttachLine(String line) {
+  final text = line.trim();
+  if (!text.startsWith('[')) {
+    return null;
+  }
+
+  Object? decoded;
+  try {
+    decoded = jsonDecode(text);
+  } on FormatException {
+    return null;
+  }
+  if (decoded is! List) {
+    return null;
+  }
+
+  for (final event in decoded) {
+    if (event is! Map || event['event'] != 'app.debugPort') {
+      continue;
+    }
+    final params = event['params'];
+    if (params is! Map) {
+      continue;
+    }
+    final wsUri = params['wsUri'];
+    if (wsUri is String && wsUri.trim().isNotEmpty) {
+      return wsUri.trim();
+    }
+    final baseUri = params['baseUri'];
+    if (baseUri is String && baseUri.trim().isNotEmpty) {
+      return baseUri.trim();
+    }
+  }
+  return null;
+}
+
+class _VmServiceUriResolution {
+  _VmServiceUriResolution(this.uri, {io.Process? process})
+    : exitCode = null,
+      _process = process;
+
+  _VmServiceUriResolution.failure(this.exitCode) : uri = null, _process = null;
+
+  final String? uri;
+  final int? exitCode;
+  final io.Process? _process;
+
+  void dispose() {
+    _process?.kill();
+  }
+}
+
+Future<String?> _resolveVmServiceUri({
+  required String? explicitUri,
+  required String? uriFilePath,
+  required io.Directory currentDirectory,
+  required Duration? timeout,
+  required StringSink errors,
+}) async {
+  final trimmedExplicitUri = explicitUri?.trim();
+  if (trimmedExplicitUri != null && trimmedExplicitUri.isNotEmpty) {
+    return trimmedExplicitUri;
+  }
+
+  final trimmedFilePath = uriFilePath?.trim();
+  if (trimmedFilePath == null || trimmedFilePath.isEmpty) {
+    errors.writeln('Missing required option: --vm-service-uri');
+    return null;
+  }
+
+  final file = io.File(_resolvePath(currentDirectory, trimmedFilePath));
+  try {
+    return await _readVmServiceUriFromFile(file, timeout: timeout);
+  } on TimeoutException {
+    errors.writeln('Timed out waiting for VM Service URI file: ${file.path}');
+    return null;
+  }
+}
+
+Future<String> _readVmServiceUriFromFile(
+  io.File file, {
+  Duration? timeout,
+}) async {
+  final started = DateTime.now();
+  while (true) {
+    if (await file.exists()) {
+      final text = (await file.readAsString()).trim();
+      if (text.isNotEmpty) {
+        return text;
+      }
+    }
+    if (timeout != null && DateTime.now().difference(started) >= timeout) {
+      throw TimeoutException('Timed out waiting for ${file.path}', timeout);
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+  }
+}
+
+String _resolvePath(io.Directory currentDirectory, String path) {
+  if (io.File(path).isAbsolute) {
+    return path;
+  }
+  return [currentDirectory.path, path].join(io.Platform.pathSeparator);
+}
+
+io.Directory _readRootDirectory(String rootPath) {
+  final root = io.Directory(rootPath);
+  if (rootPath != _defaultLogRoot || root.existsSync()) {
+    return root;
+  }
+  final legacyRoot = io.Directory(_legacyLogRoot);
+  if (legacyRoot.existsSync()) {
+    return legacyRoot;
+  }
+  return root;
+}
 
 Future<List<Map<String, Object?>>> _recordsFor(ArgResults command) async {
   final stores = await _storesFor(command);
@@ -488,7 +1418,7 @@ Future<List<JsonlLogStore>> _storesFor(ArgResults command) async {
     return [JsonlLogStore(io.File(_option(command, 'file')!))];
   }
 
-  final root = io.Directory(_option(command, 'root')!);
+  final root = _readRootDirectory(_option(command, 'root')!);
   final directoryStore = LogHoundDirectoryStore(root);
   final flavor = _option(command, 'flavor');
   final platform = _option(command, 'platform');
@@ -506,34 +1436,48 @@ Future<List<JsonlLogStore>> _storesFor(ArgResults command) async {
 }
 
 bool _usesRoutedStore(ArgResults command) {
+  if (_hasOption(command, 'file')) {
+    return _option(command, 'file') == null;
+  }
   return _option(command, 'app') != null ||
       _option(command, 'flavor') != null ||
       _option(command, 'platform') != null ||
       _option(command, 'session') != null ||
-      (command.options.contains('root') && command.wasParsed('root'));
+      _option(command, 'root') != null;
 }
 
 String? _option(ArgResults command, String name) {
-  if (!command.options.contains(name)) {
+  Object? value;
+  try {
+    value = command[name];
+  } on ArgumentError {
     return null;
   }
-  final value = command[name];
   if (value is String && value.isNotEmpty) {
     return value;
   }
   return null;
 }
 
+bool _hasOption(ArgResults command, String name) {
+  try {
+    command[name];
+    return true;
+  } on ArgumentError {
+    return false;
+  }
+}
+
 String _sourceLabel(ArgResults command) {
   if (!_usesRoutedStore(command)) {
-    return _option(command, 'file') ?? 'loghound/app.jsonl';
+    return _option(command, 'file')!;
   }
   final app = _option(command, 'app');
   final flavor = _option(command, 'flavor');
   final platform = _option(command, 'platform');
   final session = _option(command, 'session');
   final parts = <String>[
-    _option(command, 'root') ?? 'loghound',
+    _option(command, 'root') ?? _defaultLogRoot,
     if (app != null) 'app=$app',
     ?flavor,
     ?platform,
@@ -1003,10 +1947,10 @@ String _usage(ArgParser parser) {
 Usage: loghound <command> [options]
 
 Commands:
-  stay           Receive POST /logs and route by flavor/platform/session
+  run            Run Flutter and collect hidden loghound VM Service events
+  stay           Keep collecting hidden loghound VM Service events
   apps           List discovered apps
   sessions       List discovered sessions
-  serve          Receive POST /logs and append JSON Lines
   query          Filter records from a JSON Lines file
   tail           Print the latest records
   latest-error   Print the latest warning/error record
@@ -1015,6 +1959,8 @@ Commands:
   http           List or show HTTP records
   body           Inspect a stored HTTP request or response body
   stats          Print log volume and capture statistics
+  doctor         Check whether logs are ready for AI investigation
+  setting        Show or update persistent loghound settings
 
 ${parser.usage}''';
 }

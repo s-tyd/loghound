@@ -1,8 +1,9 @@
 name: loghound
 description: >-
-  AI-friendly local log investigation harness for Dart and Flutter: receive logs
-  over local HTTP, store them as JSON Lines, and query the exact slice you need.
-version: 0.0.1
+  AI-friendly local log investigation harness for Dart and Flutter: collect
+  structured app logs, store them as JSON Lines, and query the exact slice you
+  need.
+version: 0.0.2
 repository: https://github.com/s-tyd/loghound
 issue_tracker: https://github.com/s-tyd/loghound/issues
 topics:
@@ -20,6 +21,8 @@ environment:
 
 dependencies:
   args: ^2.7.0
+  dio: ^5.10.0
+  vm_service: ^15.2.0
 
 dev_dependencies:
   lints: ^6.0.0

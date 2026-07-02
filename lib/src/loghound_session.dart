@@ -5,6 +5,7 @@ import 'dart:math';
 
 import 'json_safe.dart';
 import 'loghound_client.dart';
+import 'loghound_vm_service.dart';
 import 'redactor.dart';
 
 /// Sends one fully assembled log record.
@@ -181,7 +182,9 @@ class LogHoundSession {
     Object? responseBody,
     int maxRequestBodyBytes = 64 * 1024,
     int maxResponseBodyBytes = 256 * 1024,
+    int? level,
     Map<String, Object?> data = const {},
+    Map<String, Object?> fields = const {},
   }) {
     final capturedRequestBody = _captureBody(
       requestBody,
@@ -191,34 +194,41 @@ class LogHoundSession {
       responseBody,
       maxBytes: maxResponseBodyBytes,
     );
-    final fields = <String, Object?>{
+    final recordFields = <String, Object?>{
+      ...fields,
       'method': method,
       'url': url,
       'request_body_bytes': capturedRequestBody.bytes,
       'response_body_bytes': capturedResponseBody.bytes,
     };
     if (requestId != null) {
-      fields['request_id'] = requestId;
+      recordFields['request_id'] = requestId;
     }
     if (status != null) {
-      fields['status'] = status;
+      recordFields['status'] = status;
     }
     if (durationMs != null) {
-      fields['duration_ms'] = durationMs;
+      recordFields['duration_ms'] = durationMs;
     }
     if (capturedRequestBody.body != null) {
-      fields['request_body'] = capturedRequestBody.body;
+      recordFields['request_body'] = capturedRequestBody.body;
     }
     if (capturedResponseBody.body != null) {
-      fields['response_body'] = capturedResponseBody.body;
+      recordFields['response_body'] = capturedResponseBody.body;
     }
     if (capturedRequestBody.truncated) {
-      fields['request_body_truncated'] = true;
+      recordFields['request_body_truncated'] = true;
     }
     if (capturedResponseBody.truncated) {
-      fields['response_body_truncated'] = true;
+      recordFields['response_body_truncated'] = true;
     }
-    send(kind: 'http', name: 'HTTP', data: data, fields: fields);
+    send(
+      kind: 'http',
+      name: 'HTTP',
+      level: level,
+      data: data,
+      fields: recordFields,
+    );
   }
 
   /// Emits a custom structured record.
@@ -267,11 +277,8 @@ class LogHoundSession {
 class LogHound {
   LogHound._();
 
-  /// Default endpoint used when `LOGHOUND_URL` is not provided.
-  static const String defaultEndpoint = String.fromEnvironment(
-    'LOGHOUND_URL',
-    defaultValue: 'http://127.0.0.1:8765/logs',
-  );
+  /// VM Service extension event kind used for hidden loghound records.
+  static const String defaultVmServiceEventKind = logHoundVmServiceEventKind;
 
   static LogHoundSession? _current;
 
@@ -283,21 +290,17 @@ class LogHound {
     required String appId,
     required String flavor,
     required R Function() app,
-    Uri? endpoint,
     String? sessionId,
     bool? enabled,
     LogHoundCapture capture = const LogHoundCapture(),
-    Duration timeout = const Duration(seconds: 2),
+    LogHoundVmServiceEventSink? postEvent,
     Map<String, Object?> data = const {},
   }) {
     if (!(enabled ?? _debugModeEnabled())) {
       return app();
     }
 
-    final client = LogHoundClient(
-      endpoint ?? Uri.parse(defaultEndpoint),
-      timeout: timeout,
-    );
+    final client = LogHoundClient(postEvent: postEvent);
     final session = LogHoundSession.client(
       config: LogHoundSessionConfig(
         appId: appId,
@@ -316,14 +319,14 @@ class LogHound {
         ? ZoneSpecification(
             print: (self, parent, zone, line) {
               parent.print(zone, line);
-              session.log(line, name: 'print');
+              _current?.log(line, name: 'print');
             },
           )
         : null;
 
     return runZonedGuarded<R?>(app, (error, stackTrace) {
       if (capture.errors) {
-        session.error(error, stackTrace, name: 'Zone');
+        _current?.error(error, stackTrace, name: 'Zone');
       }
     }, zoneSpecification: specification);
   }
@@ -396,7 +399,9 @@ class LogHound {
     Object? responseBody,
     int maxRequestBodyBytes = 64 * 1024,
     int maxResponseBodyBytes = 256 * 1024,
+    int? level,
     Map<String, Object?> data = const {},
+    Map<String, Object?> fields = const {},
   }) {
     _current?.http(
       method: method,
@@ -408,7 +413,9 @@ class LogHound {
       responseBody: responseBody,
       maxRequestBodyBytes: maxRequestBodyBytes,
       maxResponseBodyBytes: maxResponseBodyBytes,
+      level: level,
       data: data,
+      fields: fields,
     );
   }
 

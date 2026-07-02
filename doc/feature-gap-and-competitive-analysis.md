@@ -18,8 +18,8 @@ non-goals for the first releases.
 
 The package already has the foundation for AI-assisted local investigation:
 
-- `loghound stay` receives local HTTP logs and routes them by flavor, platform,
-  and session under the app's local log root.
+- `loghound stay` reads hidden Dart VM Service extension events and routes them
+  by flavor, platform, and session under the app's local log root.
 - `LogHound.run` creates a debug-only session, captures `print`, captures zone
   errors, and stamps records with app, flavor, platform, and session metadata.
 - Manual `LogHound.action`, `LogHound.screen`, `LogHound.error`, and
@@ -63,7 +63,7 @@ large operational configuration surfaces.
 ## Prioritized Backlog
 
 1. `loghound doctor`
-   - Diagnose receiver URL, port reachability, writable root, app metadata,
+   - Diagnose collector availability, writable root, app metadata,
      flavor/platform/session routing, and common setup mistakes.
    - Keep it as a leaf command with no schema changes.
 
@@ -95,7 +95,7 @@ large operational configuration surfaces.
 7. MCP server
    - Start with a thin wrapper around `latest-error` and `context`.
    - Do not wait for all streaming work if the initial tool output is bounded.
-   - Keep the same local trust boundary as the receiver.
+   - Keep the same local trust boundary as the generated JSONL files.
 
 8. Error fingerprint and grouping
    - Add a stable fingerprint field and grouped `latest-error` output.

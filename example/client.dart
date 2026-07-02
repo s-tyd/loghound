@@ -1,7 +1,7 @@
 import 'package:loghound/loghound.dart';
 
 Future<void> main() async {
-  final client = LogHoundClient(Uri.parse('http://127.0.0.1:8765/logs'));
+  final client = LogHoundClient();
 
   try {
     client.send({
