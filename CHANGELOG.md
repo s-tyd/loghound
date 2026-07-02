@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.0.3
+
+- Remove device-specific examples from the README, example docs, and product
+  overview. The default setup now shows `loghound run` and `loghound stay`
+  without requiring users to think about a specific simulator or device name.
+
 ## 0.0.2
 
 - Replace the local HTTP receiver capture path with hidden Dart VM Service

@@ -13,7 +13,7 @@ searching, slicing, and inspecting only the parts needed to debug a problem.
 The developer usually starts the app through loghound:
 
 ```bash
-loghound run -d iPhone15Pro
+loghound run
 ```
 
 `loghound run` starts `flutter run` and collects hidden `loghound.log`
@@ -24,8 +24,8 @@ internal to loghound.
 For split terminals, the developer can keep the collector running separately:
 
 ```bash
-loghound stay -d iPhone15Pro
-flutter run -d iPhone15Pro
+loghound stay
+flutter run
 ```
 
 Flutter apps use one small debug-only setup:

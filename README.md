@@ -49,7 +49,7 @@ dart pub global activate loghound
 Run your Flutter app through loghound:
 
 ```bash
-loghound run -d iPhone15Pro
+loghound run
 ```
 
 `loghound run` uses `.fvm/flutter_sdk/bin/flutter` automatically when the
@@ -59,17 +59,18 @@ events, and writes JSONL records under `.loghound/`.
 Common Flutter launch arguments can be passed directly:
 
 ```bash
-loghound run -d iPhone15Pro --flavor dev --dart-define-from-file=.env
+loghound run --flavor dev --dart-define-from-file=.env
 ```
 
-Pass any other `flutter run` arguments after `--`.
+Device selection is optional. When needed, use the same device id or name you
+would pass to `flutter run`.
 
 If you want the collector and Flutter process split across terminals, start the
 collector first:
 
 ```bash
-loghound stay -d iPhone15Pro
-flutter run -d iPhone15Pro
+loghound stay
+flutter run
 ```
 
 `LogHound.run` stamps `app_id`, `flavor`, `platform`, and `session_id` for
@@ -138,7 +139,7 @@ logs.send({
 ## CLI
 
 ```bash
-loghound run -d iPhone15Pro                  # flutter run + hidden collector
+loghound run                                # flutter run + hidden collector
 loghound stay                                # hidden collector only
 loghound apps
 loghound sessions --flavor staging
@@ -202,7 +203,7 @@ LOGHOUND_CAPTURE_HTTP_RESPONSE_BODY=true
 Then pass the settings into Flutter, for example:
 
 ```bash
-loghound run -d iPhone15Pro --flavor dev --dart-define-from-file=.env
+loghound run --flavor dev --dart-define-from-file=.env
 ```
 
 The same policy is visible in `loghound setting` as

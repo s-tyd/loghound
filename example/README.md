@@ -3,14 +3,14 @@
 Run a Flutter app and collect hidden events:
 
 ```bash
-dart run loghound:loghound run -d iPhone15Pro
+dart run loghound:loghound run
 ```
 
 For split terminals, keep the collector running and start Flutter normally:
 
 ```bash
-dart run loghound:loghound stay -d iPhone15Pro
-flutter run -d iPhone15Pro
+dart run loghound:loghound stay
+flutter run
 ```
 
 Examples:
