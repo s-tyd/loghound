@@ -6,6 +6,7 @@ import 'package:loghound/loghound.dart';
 import 'package:loghound/src/cli.dart';
 import 'package:loghound/src/loghound_settings.dart';
 import 'package:test/test.dart';
+import 'package:vm_service/vm_service.dart';
 
 void main() {
   group('runLogHoundCli', () {
@@ -701,6 +702,52 @@ void main() {
       expect(records.single, containsPair('name', 'search.submit'));
     });
 
+    test(
+      'run resumes isolates that pause after VM service collection starts',
+      () async {
+        final project = Directory('${directory.path}/run-isolate-project');
+        final root = Directory('${directory.path}/run-isolate-root');
+        final out = StringBuffer();
+        final err = StringBuffer();
+        final service = FakeVmService();
+
+        final exitCode = await runLogHoundCli(
+          ['run', '--root', root.path],
+          out: out,
+          err: err,
+          currentDirectory: project,
+          processRunner: (command, args, {workingDirectory}) async {
+            final uriFileArg = args.firstWhere(
+              (arg) => arg.startsWith('--vmservice-out-file='),
+            );
+            final uriFile = File(uriFileArg.split('=').last);
+            await uriFile.parent.create(recursive: true);
+            await uriFile.writeAsString('http://127.0.0.1:12345/run=/');
+            await service.debugListenerAttached.future;
+            service.debugEvents.add(
+              Event(
+                kind: EventKind.kPauseStart,
+                isolate: IsolateRef(id: 'decode-isolate'),
+              ),
+            );
+            await service.decodeResumed.future.timeout(
+              const Duration(milliseconds: 100),
+              onTimeout: () {},
+            );
+            await service.extensionEvents.close();
+            await service.debugEvents.close();
+            return 0;
+          },
+          vmServiceConnector: (uri) async => service,
+        );
+
+        expect(exitCode, 0);
+        expect(service.listenedStreams, contains(EventStreams.kExtension));
+        expect(service.listenedStreams, contains(EventStreams.kDebug));
+        expect(service.resumedIsolates, contains('decode-isolate'));
+      },
+    );
+
     test('run passes flavor and dart define file to flutter run', () async {
       final project = Directory('${directory.path}/run-flavor-project');
       final root = Directory('${directory.path}/run-flavor-root');
@@ -1227,4 +1274,56 @@ class StreamProcess implements Process {
     unawaited(_stdin.close());
     return true;
   }
+}
+
+class FakeVmService extends VmService {
+  FakeVmService() : super(const Stream<dynamic>.empty(), (_) {});
+
+  final StreamController<Event> extensionEvents =
+      StreamController<Event>.broadcast();
+  late final StreamController<Event> debugEvents =
+      StreamController<Event>.broadcast(
+        onListen: () {
+          if (!debugListenerAttached.isCompleted) {
+            debugListenerAttached.complete();
+          }
+        },
+      );
+  final Completer<void> debugListenerAttached = Completer<void>();
+  final Completer<void> decodeResumed = Completer<void>();
+  final List<String> listenedStreams = [];
+  final List<String> resumedIsolates = [];
+
+  @override
+  Stream<Event> get onExtensionEvent => extensionEvents.stream;
+
+  @override
+  Stream<Event> get onDebugEvent => debugEvents.stream;
+
+  @override
+  Future<Success> streamListen(String streamId) async {
+    listenedStreams.add(streamId);
+    return Success();
+  }
+
+  @override
+  Future<VM> getVM() async {
+    return VM(isolates: [IsolateRef(id: 'main-isolate')]);
+  }
+
+  @override
+  Future<Success> resume(
+    String isolateId, {
+    String? step,
+    int? frameIndex,
+  }) async {
+    resumedIsolates.add(isolateId);
+    if (isolateId == 'decode-isolate' && !decodeResumed.isCompleted) {
+      decodeResumed.complete();
+    }
+    return Success();
+  }
+
+  @override
+  Future<void> dispose() async {}
 }

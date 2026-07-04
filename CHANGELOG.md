@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.0.4
+
+- Fix `loghound run` leaving isolates spawned after startup paused when
+  `flutter run --start-paused` is used internally. This prevents large Dio JSON
+  responses from hanging when Dio decodes them in a worker isolate.
+
 ## 0.0.3
 
 - Remove device-specific examples from the README, example docs, and product

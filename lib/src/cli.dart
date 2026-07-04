@@ -45,6 +45,9 @@ typedef LogHoundVmServiceEventFactory =
       required bool resumeOnListen,
     });
 
+/// Opens a Dart VM Service connection for a websocket URI.
+typedef LogHoundVmServiceConnector = Future<VmService> Function(String wsUri);
+
 /// Runs the `loghound` command-line interface.
 Future<int> runLogHoundCli(
   List<String> args, {
@@ -55,6 +58,7 @@ Future<int> runLogHoundCli(
   LogHoundProcessRunner? processRunner,
   LogHoundProcessStarter? processStarter,
   LogHoundVmServiceEventFactory? vmServiceEventFactory,
+  LogHoundVmServiceConnector? vmServiceConnector,
   int? maxVmServiceConnections,
   Duration? vmServiceUriFileTimeout,
 }) async {
@@ -97,6 +101,7 @@ Future<int> runLogHoundCli(
         vmServiceEvents,
         processStarter ?? _defaultProcessStarter,
         vmServiceEventFactory: vmServiceEventFactory,
+        vmServiceConnector: vmServiceConnector,
         maxVmServiceConnections: maxVmServiceConnections,
         vmServiceUriFileTimeout: vmServiceUriFileTimeout,
       );
@@ -109,6 +114,7 @@ Future<int> runLogHoundCli(
         processRunner ?? _defaultProcessRunner,
         vmServiceEvents,
         vmServiceEventFactory: vmServiceEventFactory,
+        vmServiceConnector: vmServiceConnector,
         vmServiceUriFileTimeout: vmServiceUriFileTimeout,
       );
     case 'query':
@@ -321,6 +327,7 @@ Future<int> _runStay(
   Stream<LogHoundVmServiceEvent>? injectedEvents,
   LogHoundProcessStarter processStarter, {
   LogHoundVmServiceEventFactory? vmServiceEventFactory,
+  LogHoundVmServiceConnector? vmServiceConnector,
   int? maxVmServiceConnections,
   Duration? vmServiceUriFileTimeout,
 }) async {
@@ -348,6 +355,7 @@ Future<int> _runStay(
       errors: errors,
       injectedEvents: injectedEvents,
       vmServiceEventFactory: vmServiceEventFactory,
+      vmServiceConnector: vmServiceConnector,
       keepAlive: injectedEvents == null,
       maxConnections: maxVmServiceConnections,
     );
@@ -364,6 +372,7 @@ Future<int> _runRun(
   LogHoundProcessRunner processRunner,
   Stream<LogHoundVmServiceEvent>? injectedEvents, {
   LogHoundVmServiceEventFactory? vmServiceEventFactory,
+  LogHoundVmServiceConnector? vmServiceConnector,
   Duration? vmServiceUriFileTimeout,
 }) async {
   final uriFile = io.File(
@@ -447,6 +456,7 @@ Future<int> _runRun(
       errors: errors,
       injectedEvents: injectedEvents,
       vmServiceEventFactory: vmServiceEventFactory,
+      vmServiceConnector: vmServiceConnector,
       resumeOnListen: true,
     );
     if (collectExit != 0) {
@@ -469,6 +479,7 @@ Future<int> _runRun(
     errors: errors,
     injectedEvents: injectedEvents,
     vmServiceEventFactory: vmServiceEventFactory,
+    vmServiceConnector: vmServiceConnector,
     resumeOnListen: true,
   );
   final runExit = await flutterExit;
@@ -486,6 +497,7 @@ Future<int> _collectVmServiceEvents({
   required StringSink errors,
   required Stream<LogHoundVmServiceEvent>? injectedEvents,
   LogHoundVmServiceEventFactory? vmServiceEventFactory,
+  LogHoundVmServiceConnector? vmServiceConnector,
   bool resumeOnListen = false,
   bool keepAlive = false,
   int? maxConnections,
@@ -509,11 +521,18 @@ Future<int> _collectVmServiceEvents({
     try {
       final events =
           injectedEvents ??
-          eventFactory(
-            trimmedServiceUri!,
-            errors: errors,
-            resumeOnListen: resumeOnListen,
-          );
+          (vmServiceConnector == null
+              ? eventFactory(
+                  trimmedServiceUri!,
+                  errors: errors,
+                  resumeOnListen: resumeOnListen,
+                )
+              : _vmServiceEvents(
+                  trimmedServiceUri!,
+                  errors: errors,
+                  resumeOnListen: resumeOnListen,
+                  vmServiceConnector: vmServiceConnector,
+                ));
 
       await for (final event in events) {
         final record = logHoundDecodeVmServiceEvent(
@@ -567,13 +586,22 @@ Stream<LogHoundVmServiceEvent> _vmServiceEvents(
   String serviceUri, {
   required StringSink errors,
   bool resumeOnListen = false,
+  LogHoundVmServiceConnector? vmServiceConnector,
 }) async* {
   final wsUri = logHoundVmServiceWebSocketUri(serviceUri).toString();
-  final service = await vmServiceConnectUri(wsUri);
+  final service = await (vmServiceConnector ?? vmServiceConnectUri)(wsUri);
+  StreamSubscription<Event>? debugSubscription;
+  final resumedIsolateIds = <String>{};
   try {
     await service.streamListen(EventStreams.kExtension);
     if (resumeOnListen) {
-      await _resumeMainIsolate(service, errors);
+      await service.streamListen(EventStreams.kDebug);
+      debugSubscription = service.onDebugEvent.listen((event) {
+        unawaited(
+          _resumePauseStartIsolate(service, event, errors, resumedIsolateIds),
+        );
+      });
+      await _resumeInitialAppIsolate(service, errors, resumedIsolateIds);
     }
     errors.writeln('loghound collecting from $serviceUri');
     await for (final event in service.onExtensionEvent) {
@@ -583,11 +611,16 @@ Stream<LogHoundVmServiceEvent> _vmServiceEvents(
       );
     }
   } finally {
+    await debugSubscription?.cancel();
     await service.dispose();
   }
 }
 
-Future<void> _resumeMainIsolate(VmService service, StringSink errors) async {
+Future<void> _resumeInitialAppIsolate(
+  VmService service,
+  StringSink errors,
+  Set<String> resumedIsolateIds,
+) async {
   try {
     final vm = await service.getVM();
     final isolates = vm.isolates ?? const <IsolateRef>[];
@@ -600,9 +633,41 @@ Future<void> _resumeMainIsolate(VmService service, StringSink errors) async {
       errors.writeln('No app isolate found to resume.');
       return;
     }
+    if (resumedIsolateIds.contains(isolateId)) {
+      return;
+    }
     await service.resume(isolateId);
+    resumedIsolateIds.add(isolateId);
   } on Object catch (error) {
     errors.writeln('Failed to resume paused app isolate: $error');
+  }
+}
+
+Future<void> _resumePauseStartIsolate(
+  VmService service,
+  Event event,
+  StringSink errors,
+  Set<String> resumedIsolateIds,
+) async {
+  if (event.kind != EventKind.kPauseStart) {
+    return;
+  }
+  final isolate = event.isolate;
+  if (isolate?.isSystemIsolate == true) {
+    return;
+  }
+  final isolateId = isolate?.id;
+  if (isolateId == null || isolateId.isEmpty) {
+    return;
+  }
+  if (resumedIsolateIds.contains(isolateId)) {
+    return;
+  }
+  try {
+    await service.resume(isolateId);
+    resumedIsolateIds.add(isolateId);
+  } on Object catch (error) {
+    errors.writeln('Failed to resume paused isolate $isolateId: $error');
   }
 }
 

@@ -15,3 +15,6 @@ and tests in sync.
   the relevant coverage through `action_records` and `http_body_records`.
 - Do not add a runtime-only knob without documenting how an AI agent can
   discover the setting later.
+- When publishing a package version, complete the release loop: run verification,
+  commit the release changes, publish to pub.dev, and push the release commit to
+  the remote branch before reporting completion.

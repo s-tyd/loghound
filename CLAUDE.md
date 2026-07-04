@@ -12,3 +12,6 @@ When editing LogHound, avoid hidden logging/configuration drift.
 - If a change is meant to improve AI investigation, make sure `loghound doctor`
   or `loghound setting` exposes enough signal for an agent to notice missing
   coverage.
+- When publishing a package version, do not stop at pub.dev upload. Run
+  verification, commit the release changes, publish, push the release commit to
+  the remote branch, and only then report the release as complete.
