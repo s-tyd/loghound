@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.0.5
+
+- Harden `loghound run` isolate resume handling for `--start-paused` Flutter
+  runs. LogHound now resumes all paused app isolates visible at VM Service
+  connection time, catches PauseStart events without a listener race, and avoids
+  force-resuming through DDS when `readyToResume` is available.
+- Keep VM Service extension event collection alive when debug stream setup or
+  isolate inspection is slow, unavailable, or racing with app shutdown.
+- Restore the VM Service event factory test seam when a connector is also
+  supplied.
+
 ## 0.0.4
 
 - Fix `loghound run` leaving isolates spawned after startup paused when

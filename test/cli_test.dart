@@ -723,7 +723,10 @@ void main() {
             final uriFile = File(uriFileArg.split('=').last);
             await uriFile.parent.create(recursive: true);
             await uriFile.writeAsString('http://127.0.0.1:12345/run=/');
-            await service.debugListenerAttached.future;
+            await service.debugListenerAttached.future.timeout(
+              const Duration(seconds: 1),
+              onTimeout: () => fail('Debug event listener was not attached.'),
+            );
             service.debugEvents.add(
               Event(
                 kind: EventKind.kPauseStart,
@@ -731,7 +734,7 @@ void main() {
               ),
             );
             await service.decodeResumed.future.timeout(
-              const Duration(milliseconds: 100),
+              const Duration(seconds: 1),
               onTimeout: () {},
             );
             await service.extensionEvents.close();
@@ -744,7 +747,452 @@ void main() {
         expect(exitCode, 0);
         expect(service.listenedStreams, contains(EventStreams.kExtension));
         expect(service.listenedStreams, contains(EventStreams.kDebug));
+        expect(service.resumedIsolates, contains('main-isolate'));
         expect(service.resumedIsolates, contains('decode-isolate'));
+      },
+    );
+
+    test(
+      'run resumes every paused app isolate present when VM service connects',
+      () async {
+        final project = Directory('${directory.path}/run-initial-isolates');
+        final root = Directory('${directory.path}/run-initial-isolates-root');
+        final out = StringBuffer();
+        final service = FakeVmService(
+          vmIsolates: [
+            IsolateRef(id: 'main-isolate'),
+            IsolateRef(id: 'decode-isolate'),
+            IsolateRef(id: 'running-isolate'),
+            IsolateRef(id: 'system-isolate', isSystemIsolate: true),
+          ],
+          pauseEventKinds: {
+            'main-isolate': EventKind.kPauseStart,
+            'decode-isolate': EventKind.kPauseStart,
+            'running-isolate': EventKind.kResume,
+          },
+        );
+
+        final exitCode = await runLogHoundCli(
+          ['run', '--root', root.path],
+          out: out,
+          currentDirectory: project,
+          processRunner: (command, args, {workingDirectory}) async {
+            await _writeVmServiceUri(args);
+            await Future.wait<void>([
+              service.resumed('main-isolate'),
+              service.resumed('decode-isolate'),
+            ]).timeout(
+              const Duration(seconds: 1),
+              onTimeout: () => const <void>[],
+            );
+            await service.extensionEvents.close();
+            await service.debugEvents.close();
+            return 0;
+          },
+          vmServiceConnector: (uri) async => service,
+        );
+
+        expect(exitCode, 0);
+        expect(
+          service.resumedIsolates,
+          containsAll(['main-isolate', 'decode-isolate']),
+        );
+        expect(service.resumedIsolates, isNot(contains('system-isolate')));
+        expect(service.resumedIsolates, isNot(contains('running-isolate')));
+      },
+    );
+
+    test(
+      'run handles PauseStart delivered while subscribing to debug stream',
+      () async {
+        final project = Directory('${directory.path}/run-debug-race');
+        final root = Directory('${directory.path}/run-debug-race-root');
+        final out = StringBuffer();
+        final service = FakeVmService(
+          vmIsolates: const [],
+          debugEventDuringDebugStreamListen: Event(
+            kind: EventKind.kPauseStart,
+            isolate: IsolateRef(id: 'decode-isolate'),
+          ),
+        );
+
+        final exitCode = await runLogHoundCli(
+          ['run', '--root', root.path],
+          out: out,
+          currentDirectory: project,
+          processRunner: (command, args, {workingDirectory}) async {
+            await _writeVmServiceUri(args);
+            await service.debugListenerAttached.future.timeout(
+              const Duration(seconds: 1),
+              onTimeout: () => fail('Debug event listener was not attached.'),
+            );
+            await service
+                .resumed('decode-isolate')
+                .timeout(const Duration(seconds: 1), onTimeout: () {});
+            await service.extensionEvents.close();
+            await service.debugEvents.close();
+            return 0;
+          },
+          vmServiceConnector: (uri) async => service,
+        );
+
+        expect(exitCode, 0);
+        expect(service.resumedIsolates, contains('decode-isolate'));
+      },
+    );
+
+    test('run uses readyToResume before force resume', () async {
+      final project = Directory('${directory.path}/run-ready-to-resume');
+      final root = Directory('${directory.path}/run-ready-to-resume-root');
+      final out = StringBuffer();
+      final service = FakeVmService();
+
+      final exitCode = await runLogHoundCli(
+        ['run', '--root', root.path],
+        out: out,
+        currentDirectory: project,
+        processRunner: (command, args, {workingDirectory}) async {
+          await _writeVmServiceUri(args);
+          await service
+              .resumed('main-isolate')
+              .timeout(const Duration(seconds: 1), onTimeout: () {});
+          await service.extensionEvents.close();
+          await service.debugEvents.close();
+          return 0;
+        },
+        vmServiceConnector: (uri) async => service,
+      );
+
+      expect(exitCode, 0);
+      expect(service.readyToResumeIsolates, contains('main-isolate'));
+      expect(service.forcedResumedIsolates, isEmpty);
+    });
+
+    test(
+      'run falls back to resume when readyToResume is unavailable',
+      () async {
+        final project = Directory('${directory.path}/run-ready-fallback');
+        final root = Directory('${directory.path}/run-ready-fallback-root');
+        final out = StringBuffer();
+        final service = FakeVmService(supportsReadyToResume: false);
+
+        final exitCode = await runLogHoundCli(
+          ['run', '--root', root.path],
+          out: out,
+          currentDirectory: project,
+          processRunner: (command, args, {workingDirectory}) async {
+            await _writeVmServiceUri(args);
+            await service
+                .resumed('main-isolate')
+                .timeout(const Duration(seconds: 1), onTimeout: () {});
+            await service.extensionEvents.close();
+            await service.debugEvents.close();
+            return 0;
+          },
+          vmServiceConnector: (uri) async => service,
+        );
+
+        expect(exitCode, 0);
+        expect(service.readyToResumeAttempts, contains('main-isolate'));
+        expect(service.forcedResumedIsolates, contains('main-isolate'));
+      },
+    );
+
+    test('run retries a transient resume approval failure once', () async {
+      final project = Directory('${directory.path}/run-resume-retry');
+      final root = Directory('${directory.path}/run-resume-retry-root');
+      final out = StringBuffer();
+      final service = FakeVmService(
+        readyToResumeFailuresBeforeSuccess: {'main-isolate': 1},
+      );
+
+      final exitCode = await runLogHoundCli(
+        ['run', '--root', root.path],
+        out: out,
+        currentDirectory: project,
+        processRunner: (command, args, {workingDirectory}) async {
+          await _writeVmServiceUri(args);
+          await service
+              .resumed('main-isolate')
+              .timeout(const Duration(seconds: 1), onTimeout: () {});
+          await service.extensionEvents.close();
+          await service.debugEvents.close();
+          return 0;
+        },
+        vmServiceConnector: (uri) async => service,
+      );
+
+      expect(exitCode, 0);
+      expect(
+        service.readyToResumeAttempts.where((id) => id == 'main-isolate'),
+        hasLength(2),
+      );
+      expect(service.readyToResumeIsolates, contains('main-isolate'));
+    });
+
+    test('run deduplicates initial and PauseStart resume races', () async {
+      final project = Directory('${directory.path}/run-resume-dedup');
+      final root = Directory('${directory.path}/run-resume-dedup-root');
+      final out = StringBuffer();
+      final service = FakeVmService(
+        supportsReadyToResume: false,
+        resumeDelay: const Duration(milliseconds: 50),
+      );
+
+      final exitCode = await runLogHoundCli(
+        ['run', '--root', root.path],
+        out: out,
+        currentDirectory: project,
+        processRunner: (command, args, {workingDirectory}) async {
+          await _writeVmServiceUri(args);
+          await service.debugListenerAttached.future.timeout(
+            const Duration(seconds: 1),
+            onTimeout: () => fail('Debug event listener was not attached.'),
+          );
+          service.debugEvents.add(
+            Event(
+              kind: EventKind.kPauseStart,
+              isolate: IsolateRef(id: 'main-isolate'),
+            ),
+          );
+          await service
+              .resumed('main-isolate')
+              .timeout(const Duration(seconds: 1), onTimeout: () {});
+          await service.extensionEvents.close();
+          await service.debugEvents.close();
+          return 0;
+        },
+        vmServiceConnector: (uri) async => service,
+      );
+
+      await Future<void>.delayed(const Duration(milliseconds: 80));
+
+      expect(exitCode, 0);
+      expect(
+        service.forcedResumedIsolates.where((id) => id == 'main-isolate'),
+        hasLength(1),
+      );
+    });
+
+    test(
+      'run keeps collecting extension events when debug stream setup fails',
+      () async {
+        final project = Directory('${directory.path}/run-debug-fails');
+        final root = Directory('${directory.path}/run-debug-fails-root');
+        final out = StringBuffer();
+        final err = StringBuffer();
+        final service = FakeVmService(failDebugStreamListen: true);
+
+        final exitCode = await runLogHoundCli(
+          ['run', '--root', root.path],
+          out: out,
+          err: err,
+          currentDirectory: project,
+          processRunner: (command, args, {workingDirectory}) async {
+            await _writeVmServiceUri(args);
+            await service.extensionListenerAttached.future.timeout(
+              const Duration(seconds: 1),
+              onTimeout: () {
+                fail('Extension event listener was not attached.');
+              },
+            );
+            service.extensionEvents.add(_logHoundVmServiceEvent());
+            await service.extensionEvents.close();
+            await service.debugEvents.close();
+            return 0;
+          },
+          vmServiceConnector: (uri) async => service,
+        );
+
+        expect(exitCode, 0);
+        expect(err.toString(), isNot(contains('VM Service connection failed')));
+        final records = await JsonlLogStore(
+          File('${root.path}/staging/ios/sessions/session-1.jsonl'),
+        ).readAll();
+        expect(records.single, containsPair('name', 'search.submit'));
+      },
+    );
+
+    test(
+      'run starts collecting extension events before initial isolate inspection finishes',
+      () async {
+        final project = Directory('${directory.path}/run-slow-isolate-inspect');
+        final root = Directory(
+          '${directory.path}/run-slow-isolate-inspect-root',
+        );
+        final out = StringBuffer();
+        final service = FakeVmService(
+          getIsolateDelay: const Duration(milliseconds: 1500),
+        );
+
+        final exitCode = await runLogHoundCli(
+          ['run', '--root', root.path],
+          out: out,
+          currentDirectory: project,
+          processRunner: (command, args, {workingDirectory}) async {
+            await _writeVmServiceUri(args);
+            await service.extensionListenerAttached.future.timeout(
+              const Duration(seconds: 1),
+              onTimeout: () {
+                fail(
+                  'Extension event listener was blocked by isolate inspect.',
+                );
+              },
+            );
+            service.extensionEvents.add(_logHoundVmServiceEvent());
+            await service.extensionEvents.close();
+            await service.debugEvents.close();
+            return 0;
+          },
+          vmServiceConnector: (uri) async => service,
+        );
+
+        expect(exitCode, 0);
+        final records = await JsonlLogStore(
+          File('${root.path}/staging/ios/sessions/session-1.jsonl'),
+        ).readAll();
+        expect(records.single, containsPair('name', 'search.submit'));
+      },
+    );
+
+    test(
+      'run ignores isolate-must-be-paused from external resume races',
+      () async {
+        final project = Directory('${directory.path}/run-resume-race');
+        final root = Directory('${directory.path}/run-resume-race-root');
+        final out = StringBuffer();
+        final err = StringBuffer();
+        final service = FakeVmService(
+          readyToResumeErrorCodes: {
+            'main-isolate': RPCErrorKind.kIsolateMustBePaused.code,
+          },
+        );
+
+        final exitCode = await runLogHoundCli(
+          ['run', '--root', root.path],
+          out: out,
+          err: err,
+          currentDirectory: project,
+          processRunner: (command, args, {workingDirectory}) async {
+            await _writeVmServiceUri(args);
+            await service
+                .readyToResumeAttempted('main-isolate')
+                .timeout(
+                  const Duration(seconds: 1),
+                  onTimeout: () {
+                    fail('readyToResume was not attempted.');
+                  },
+                );
+            await Future<void>.delayed(const Duration(milliseconds: 120));
+            await service.extensionEvents.close();
+            await service.debugEvents.close();
+            return 0;
+          },
+          vmServiceConnector: (uri) async => service,
+        );
+
+        expect(exitCode, 0);
+        expect(err.toString(), isNot(contains('Failed to resume')));
+      },
+    );
+
+    test(
+      'run suppresses resume errors caused by VM service disposal',
+      () async {
+        final project = Directory('${directory.path}/run-resume-dispose');
+        final root = Directory('${directory.path}/run-resume-dispose-root');
+        final out = StringBuffer();
+        final err = StringBuffer();
+        final service = FakeVmService(
+          vmIsolates: const [],
+          supportsReadyToResume: false,
+          resumeDelay: const Duration(milliseconds: 50),
+          failResumeIfDisposed: true,
+        );
+
+        final exitCode = await runLogHoundCli(
+          ['run', '--root', root.path],
+          out: out,
+          err: err,
+          currentDirectory: project,
+          processRunner: (command, args, {workingDirectory}) async {
+            await _writeVmServiceUri(args);
+            await service.debugListenerAttached.future.timeout(
+              const Duration(seconds: 1),
+              onTimeout: () => fail('Debug event listener was not attached.'),
+            );
+            service.debugEvents.add(
+              Event(
+                kind: EventKind.kPauseStart,
+                isolate: IsolateRef(id: 'decode-isolate'),
+              ),
+            );
+            await Future<void>.delayed(Duration.zero);
+            await service.extensionEvents.close();
+            await service.debugEvents.close();
+            return 0;
+          },
+          vmServiceConnector: (uri) async => service,
+        );
+
+        await Future<void>.delayed(const Duration(milliseconds: 80));
+
+        expect(exitCode, 0);
+        expect(err.toString(), isNot(contains('Failed to resume')));
+      },
+    );
+
+    test(
+      'VM service event factory takes precedence over connector test seam',
+      () async {
+        final root = Directory('${directory.path}/factory-before-connector');
+        final out = StringBuffer();
+        var factoryCalls = 0;
+        var connectorCalls = 0;
+
+        final exitCode = await runLogHoundCli(
+          [
+            'stay',
+            '--root',
+            root.path,
+            '--vm-service-uri',
+            'http://127.0.0.1:12345/abc=/',
+          ],
+          out: out,
+          maxVmServiceConnections: 1,
+          vmServiceEventFactory:
+              (serviceUri, {required errors, required resumeOnListen}) {
+                factoryCalls++;
+                return Stream<LogHoundVmServiceEvent>.fromIterable([
+                  const LogHoundVmServiceEvent(
+                    kind: logHoundVmServiceEventKind,
+                    data: {
+                      'timestamp': '2026-06-27T10:00:00.000',
+                      'app_id': 'guide-app',
+                      'flavor': 'staging',
+                      'platform': 'ios',
+                      'session_id': 'session-1',
+                      'kind': 'action',
+                      'name': 'search.submit',
+                    },
+                  ),
+                ]);
+              },
+          vmServiceConnector: (uri) async {
+            connectorCalls++;
+            final service = FakeVmService();
+            await service.extensionEvents.close();
+            return service;
+          },
+        );
+
+        expect(exitCode, 0);
+        expect(factoryCalls, 1);
+        expect(connectorCalls, 0);
+        final records = await JsonlLogStore(
+          File('${root.path}/staging/ios/sessions/session-1.jsonl'),
+        ).readAll();
+        expect(records.single, containsPair('name', 'search.submit'));
       },
     );
 
@@ -1276,11 +1724,73 @@ class StreamProcess implements Process {
   }
 }
 
-class FakeVmService extends VmService {
-  FakeVmService() : super(const Stream<dynamic>.empty(), (_) {});
+Future<void> _writeVmServiceUri(List<String> args) async {
+  final uriFileArg = args.firstWhere(
+    (arg) => arg.startsWith('--vmservice-out-file='),
+  );
+  final uriFile = File(uriFileArg.split('=').last);
+  await uriFile.parent.create(recursive: true);
+  await uriFile.writeAsString('http://127.0.0.1:12345/run=/');
+}
 
-  final StreamController<Event> extensionEvents =
-      StreamController<Event>.broadcast();
+Event _logHoundVmServiceEvent() {
+  final data = ExtensionData()
+    ..data.addAll({
+      'timestamp': '2026-06-27T10:00:00.000',
+      'app_id': 'guide-app',
+      'flavor': 'staging',
+      'platform': 'ios',
+      'session_id': 'session-1',
+      'kind': 'action',
+      'name': 'search.submit',
+    });
+  return Event(
+    kind: EventKind.kExtension,
+    extensionKind: logHoundVmServiceEventKind,
+    extensionData: data,
+  );
+}
+
+class FakeVmService extends VmService {
+  FakeVmService({
+    List<IsolateRef>? vmIsolates,
+    Map<String, String>? pauseEventKinds,
+    this.supportsReadyToResume = true,
+    Map<String, int>? readyToResumeFailuresBeforeSuccess,
+    Map<String, int>? readyToResumeErrorCodes,
+    this.getIsolateDelay = Duration.zero,
+    this.resumeDelay = Duration.zero,
+    this.failDebugStreamListen = false,
+    this.debugEventDuringDebugStreamListen,
+    this.failResumeIfDisposed = false,
+  }) : vmIsolates = vmIsolates ?? [IsolateRef(id: 'main-isolate')],
+       pauseEventKinds = pauseEventKinds ?? const {},
+       _readyToResumeFailuresBeforeSuccess = Map<String, int>.from(
+         readyToResumeFailuresBeforeSuccess ?? const {},
+       ),
+       readyToResumeErrorCodes = readyToResumeErrorCodes ?? const {},
+       super(const Stream<dynamic>.empty(), (_) {});
+
+  final List<IsolateRef> vmIsolates;
+  final Map<String, String> pauseEventKinds;
+  final bool supportsReadyToResume;
+  final Map<String, int> readyToResumeErrorCodes;
+  final Duration getIsolateDelay;
+  final Duration resumeDelay;
+  final bool failDebugStreamListen;
+  final Event? debugEventDuringDebugStreamListen;
+  final bool failResumeIfDisposed;
+  final Map<String, int> _readyToResumeFailuresBeforeSuccess;
+  bool _disposed = false;
+
+  late final StreamController<Event> extensionEvents =
+      StreamController<Event>.broadcast(
+        onListen: () {
+          if (!extensionListenerAttached.isCompleted) {
+            extensionListenerAttached.complete();
+          }
+        },
+      );
   late final StreamController<Event> debugEvents =
       StreamController<Event>.broadcast(
         onListen: () {
@@ -1289,10 +1799,30 @@ class FakeVmService extends VmService {
           }
         },
       );
+  final Completer<void> extensionListenerAttached = Completer<void>();
   final Completer<void> debugListenerAttached = Completer<void>();
   final Completer<void> decodeResumed = Completer<void>();
   final List<String> listenedStreams = [];
-  final List<String> resumedIsolates = [];
+  final List<String> readyToResumeAttempts = [];
+  final List<String> readyToResumeIsolates = [];
+  final List<String> forcedResumedIsolates = [];
+  final Map<String, Completer<void>> _readyToResumeAttempted = {};
+  final Map<String, Completer<void>> _resumed = {};
+
+  List<String> get resumedIsolates => [
+    ...readyToResumeIsolates,
+    ...forcedResumedIsolates,
+  ];
+
+  Future<void> resumed(String isolateId) {
+    return _resumed.putIfAbsent(isolateId, Completer<void>.new).future;
+  }
+
+  Future<void> readyToResumeAttempted(String isolateId) {
+    return _readyToResumeAttempted
+        .putIfAbsent(isolateId, Completer<void>.new)
+        .future;
+  }
 
   @override
   Stream<Event> get onExtensionEvent => extensionEvents.stream;
@@ -1303,12 +1833,84 @@ class FakeVmService extends VmService {
   @override
   Future<Success> streamListen(String streamId) async {
     listenedStreams.add(streamId);
+    if (streamId == EventStreams.kDebug && failDebugStreamListen) {
+      throw RPCError(
+        'streamListen',
+        RPCErrorKind.kServerError.code,
+        'debug stream failed',
+      );
+    }
+    if (streamId == EventStreams.kDebug) {
+      final event = debugEventDuringDebugStreamListen;
+      if (event != null) {
+        debugEvents.add(event);
+      }
+    }
     return Success();
   }
 
   @override
   Future<VM> getVM() async {
-    return VM(isolates: [IsolateRef(id: 'main-isolate')]);
+    return VM(isolates: vmIsolates);
+  }
+
+  @override
+  Future<Isolate> getIsolate(String isolateId) async {
+    if (getIsolateDelay > Duration.zero) {
+      await Future<void>.delayed(getIsolateDelay);
+    }
+    final ref = vmIsolates.firstWhere(
+      (isolate) => isolate.id == isolateId,
+      orElse: () => IsolateRef(id: isolateId),
+    );
+    return Isolate(
+      id: isolateId,
+      isSystemIsolate: ref.isSystemIsolate,
+      pauseEvent: Event(
+        kind: pauseEventKinds[isolateId] ?? EventKind.kPauseStart,
+        isolate: ref,
+      ),
+    );
+  }
+
+  @override
+  Future<Response> callMethod(
+    String method, {
+    String? isolateId,
+    Map<String, dynamic>? args,
+  }) async {
+    if (method != 'readyToResume') {
+      return super.callMethod(method, isolateId: isolateId, args: args);
+    }
+    final id = isolateId!;
+    readyToResumeAttempts.add(id);
+    final attemptCompleter = _readyToResumeAttempted.putIfAbsent(
+      id,
+      Completer<void>.new,
+    );
+    if (!attemptCompleter.isCompleted) {
+      attemptCompleter.complete();
+    }
+    if (!supportsReadyToResume) {
+      throw RPCError(
+        method,
+        RPCErrorKind.kMethodNotFound.code,
+        'method not found',
+      );
+    }
+    final errorCode = readyToResumeErrorCodes[id];
+    if (errorCode != null) {
+      throw RPCError(method, errorCode);
+    }
+    final failuresRemaining = _readyToResumeFailuresBeforeSuccess[id] ?? 0;
+    if (failuresRemaining > 0) {
+      _readyToResumeFailuresBeforeSuccess[id] = failuresRemaining - 1;
+      throw RPCError(method, RPCErrorKind.kServerError.code, 'transient');
+    }
+    await _maybeDelay();
+    readyToResumeIsolates.add(id);
+    _completeResumed(id);
+    return Success();
   }
 
   @override
@@ -1317,13 +1919,37 @@ class FakeVmService extends VmService {
     String? step,
     int? frameIndex,
   }) async {
-    resumedIsolates.add(isolateId);
-    if (isolateId == 'decode-isolate' && !decodeResumed.isCompleted) {
-      decodeResumed.complete();
+    await _maybeDelay();
+    if (_disposed && failResumeIfDisposed) {
+      throw RPCError(
+        'resume',
+        RPCErrorKind.kConnectionDisposed.code,
+        'Service connection disposed',
+      );
     }
+    forcedResumedIsolates.add(isolateId);
+    _completeResumed(isolateId);
     return Success();
   }
 
+  Future<void> _maybeDelay() async {
+    if (resumeDelay > Duration.zero) {
+      await Future<void>.delayed(resumeDelay);
+    }
+  }
+
+  void _completeResumed(String isolateId) {
+    final completer = _resumed.putIfAbsent(isolateId, Completer<void>.new);
+    if (!completer.isCompleted) {
+      completer.complete();
+    }
+    if (isolateId == 'decode-isolate' && !decodeResumed.isCompleted) {
+      decodeResumed.complete();
+    }
+  }
+
   @override
-  Future<void> dispose() async {}
+  Future<void> dispose() async {
+    _disposed = true;
+  }
 }

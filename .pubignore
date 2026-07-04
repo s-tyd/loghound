@@ -5,6 +5,7 @@ CLAUDE.md
 .DS_Store
 .vimana/
 doc/oss-readiness.md
+doc/review-fixes-*.md
 loghound/
 logs/
 /loghound-icon.png

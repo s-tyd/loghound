@@ -521,17 +521,17 @@ Future<int> _collectVmServiceEvents({
     try {
       final events =
           injectedEvents ??
-          (vmServiceConnector == null
-              ? eventFactory(
-                  trimmedServiceUri!,
-                  errors: errors,
-                  resumeOnListen: resumeOnListen,
-                )
-              : _vmServiceEvents(
+          (vmServiceEventFactory == null
+              ? _vmServiceEvents(
                   trimmedServiceUri!,
                   errors: errors,
                   resumeOnListen: resumeOnListen,
                   vmServiceConnector: vmServiceConnector,
+                )
+              : eventFactory(
+                  trimmedServiceUri!,
+                  errors: errors,
+                  resumeOnListen: resumeOnListen,
                 ));
 
       await for (final event in events) {
@@ -591,17 +591,21 @@ Stream<LogHoundVmServiceEvent> _vmServiceEvents(
   final wsUri = logHoundVmServiceWebSocketUri(serviceUri).toString();
   final service = await (vmServiceConnector ?? vmServiceConnectUri)(wsUri);
   StreamSubscription<Event>? debugSubscription;
-  final resumedIsolateIds = <String>{};
+  final resumeState = _ResumeState();
   try {
     await service.streamListen(EventStreams.kExtension);
     if (resumeOnListen) {
-      await service.streamListen(EventStreams.kDebug);
       debugSubscription = service.onDebugEvent.listen((event) {
         unawaited(
-          _resumePauseStartIsolate(service, event, errors, resumedIsolateIds),
+          _resumePauseStartIsolate(service, event, errors, resumeState),
         );
       });
-      await _resumeInitialAppIsolate(service, errors, resumedIsolateIds);
+      try {
+        await service.streamListen(EventStreams.kDebug);
+      } on Object catch (error) {
+        errors.writeln('Failed to set up paused isolate resume: $error');
+      }
+      unawaited(_resumeInitialAppIsolates(service, errors, resumeState));
     }
     errors.writeln('loghound collecting from $serviceUri');
     await for (final event in service.onExtensionEvent) {
@@ -611,35 +615,57 @@ Stream<LogHoundVmServiceEvent> _vmServiceEvents(
       );
     }
   } finally {
+    resumeState.disposed = true;
     await debugSubscription?.cancel();
     await service.dispose();
   }
 }
 
-Future<void> _resumeInitialAppIsolate(
+final class _ResumeState {
+  final resumedIsolateIds = <String>{};
+  bool disposed = false;
+}
+
+Future<void> _resumeInitialAppIsolates(
   VmService service,
   StringSink errors,
-  Set<String> resumedIsolateIds,
+  _ResumeState state,
 ) async {
   try {
     final vm = await service.getVM();
     final isolates = vm.isolates ?? const <IsolateRef>[];
-    final isolate = isolates
-        .where((isolate) => isolate.isSystemIsolate != true)
-        .where((isolate) => isolate.id != null && isolate.id!.isNotEmpty)
-        .firstOrNull;
-    final isolateId = isolate?.id;
-    if (isolateId == null) {
-      errors.writeln('No app isolate found to resume.');
-      return;
+    var foundAppIsolate = false;
+    for (final isolate in isolates) {
+      if (isolate.isSystemIsolate == true) {
+        continue;
+      }
+      final isolateId = isolate.id;
+      if (isolateId == null || isolateId.isEmpty) {
+        continue;
+      }
+      foundAppIsolate = true;
+      try {
+        final isolateDetails = await service.getIsolate(isolateId);
+        if (isolateDetails.pauseEvent?.kind != EventKind.kPauseStart) {
+          continue;
+        }
+      } on Object catch (error) {
+        if (!state.disposed) {
+          errors.writeln('Failed to inspect isolate $isolateId: $error');
+        }
+        continue;
+      }
+      await _resumeIsolateOnce(service, isolateId, errors, state);
     }
-    if (resumedIsolateIds.contains(isolateId)) {
-      return;
+    if (!foundAppIsolate) {
+      if (!state.disposed) {
+        errors.writeln('No app isolate found to resume.');
+      }
     }
-    await service.resume(isolateId);
-    resumedIsolateIds.add(isolateId);
   } on Object catch (error) {
-    errors.writeln('Failed to resume paused app isolate: $error');
+    if (!state.disposed) {
+      errors.writeln('Failed to inspect paused app isolates: $error');
+    }
   }
 }
 
@@ -647,7 +673,7 @@ Future<void> _resumePauseStartIsolate(
   VmService service,
   Event event,
   StringSink errors,
-  Set<String> resumedIsolateIds,
+  _ResumeState state,
 ) async {
   if (event.kind != EventKind.kPauseStart) {
     return;
@@ -660,15 +686,72 @@ Future<void> _resumePauseStartIsolate(
   if (isolateId == null || isolateId.isEmpty) {
     return;
   }
-  if (resumedIsolateIds.contains(isolateId)) {
+  await _resumeIsolateOnce(service, isolateId, errors, state);
+}
+
+Future<void> _resumeIsolateOnce(
+  VmService service,
+  String isolateId,
+  StringSink errors,
+  _ResumeState state,
+) async {
+  if (!state.resumedIsolateIds.add(isolateId)) {
     return;
   }
   try {
-    await service.resume(isolateId);
-    resumedIsolateIds.add(isolateId);
+    await _resumeIsolateWithRetry(service, isolateId);
   } on Object catch (error) {
-    errors.writeln('Failed to resume paused isolate $isolateId: $error');
+    if (!state.disposed) {
+      errors.writeln('Failed to resume paused isolate $isolateId: $error');
+    }
   }
+}
+
+Future<void> _resumeIsolateWithRetry(
+  VmService service,
+  String isolateId,
+) async {
+  Object? lastError;
+  StackTrace? lastStackTrace;
+  for (var attempt = 0; attempt < 2; attempt++) {
+    try {
+      await _readyToResumeOrResume(service, isolateId);
+      return;
+    } on Object catch (error, stackTrace) {
+      if (_isBenignResumeError(error)) {
+        return;
+      }
+      lastError = error;
+      lastStackTrace = stackTrace;
+      if (attempt == 0) {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+      }
+    }
+  }
+  return Future<void>.error(lastError!, lastStackTrace!);
+}
+
+Future<void> _readyToResumeOrResume(VmService service, String isolateId) async {
+  try {
+    await service.callMethod('readyToResume', isolateId: isolateId);
+  } on RPCError catch (error) {
+    if (error.code != RPCErrorKind.kMethodNotFound.code) {
+      rethrow;
+    }
+    await service.resume(isolateId);
+  }
+}
+
+bool _isBenignResumeError(Object error) {
+  if (error is SentinelException) {
+    return true;
+  }
+  if (error is! RPCError) {
+    return false;
+  }
+  return error.code == RPCErrorKind.kIsolateMustBePaused.code ||
+      error.code == RPCErrorKind.kConnectionDisposed.code ||
+      error.message == RPCErrorKind.kConnectionDisposed.message;
 }
 
 Future<int> _runQuery(ArgResults command, StringSink output) async {
