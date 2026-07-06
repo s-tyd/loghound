@@ -869,6 +869,96 @@ void main() {
     });
 
     test(
+      'run force resumes isolates when readyToResume leaves them start-paused',
+      () async {
+        final project = Directory('${directory.path}/run-user-paused-isolate');
+        final root = Directory('${directory.path}/run-user-paused-root');
+        final out = StringBuffer();
+        final service = FakeVmService(
+          readyToResumeLeavesPausedIsolates: {'main-isolate'},
+        );
+
+        final exitCode = await runLogHoundCli(
+          ['run', '--root', root.path],
+          out: out,
+          currentDirectory: project,
+          processRunner: (command, args, {workingDirectory}) async {
+            await _writeVmServiceUri(args);
+            await service
+                .readyToResumeAttempted('main-isolate')
+                .timeout(
+                  const Duration(seconds: 1),
+                  onTimeout: () {
+                    fail('readyToResume was not attempted.');
+                  },
+                );
+            await service
+                .resumed('main-isolate')
+                .timeout(const Duration(milliseconds: 100), onTimeout: () {});
+            await service.extensionEvents.close();
+            await service.debugEvents.close();
+            return 0;
+          },
+          vmServiceConnector: (uri) async => service,
+        );
+
+        expect(exitCode, 0);
+        expect(service.readyToResumeAttempts, contains('main-isolate'));
+        expect(service.forcedResumedIsolates, contains('main-isolate'));
+      },
+    );
+
+    test(
+      'run force resumes worker isolates left start-paused by readyToResume',
+      () async {
+        final project = Directory('${directory.path}/run-user-paused-worker');
+        final root = Directory('${directory.path}/run-user-paused-worker-root');
+        final out = StringBuffer();
+        final service = FakeVmService(
+          readyToResumeLeavesPausedIsolates: {'decode-isolate'},
+        );
+
+        final exitCode = await runLogHoundCli(
+          ['run', '--root', root.path],
+          out: out,
+          currentDirectory: project,
+          processRunner: (command, args, {workingDirectory}) async {
+            await _writeVmServiceUri(args);
+            await service.debugListenerAttached.future.timeout(
+              const Duration(seconds: 1),
+              onTimeout: () => fail('Debug event listener was not attached.'),
+            );
+            service.debugEvents.add(
+              Event(
+                kind: EventKind.kPauseStart,
+                isolate: IsolateRef(id: 'decode-isolate'),
+              ),
+            );
+            await service
+                .readyToResumeAttempted('decode-isolate')
+                .timeout(
+                  const Duration(seconds: 1),
+                  onTimeout: () {
+                    fail('readyToResume was not attempted.');
+                  },
+                );
+            await service
+                .resumed('decode-isolate')
+                .timeout(const Duration(milliseconds: 100), onTimeout: () {});
+            await service.extensionEvents.close();
+            await service.debugEvents.close();
+            return 0;
+          },
+          vmServiceConnector: (uri) async => service,
+        );
+
+        expect(exitCode, 0);
+        expect(service.readyToResumeAttempts, contains('decode-isolate'));
+        expect(service.forcedResumedIsolates, contains('decode-isolate'));
+      },
+    );
+
+    test(
       'run falls back to resume when readyToResume is unavailable',
       () async {
         final project = Directory('${directory.path}/run-ready-fallback');
@@ -1758,6 +1848,7 @@ class FakeVmService extends VmService {
     this.supportsReadyToResume = true,
     Map<String, int>? readyToResumeFailuresBeforeSuccess,
     Map<String, int>? readyToResumeErrorCodes,
+    Set<String>? readyToResumeLeavesPausedIsolates,
     this.getIsolateDelay = Duration.zero,
     this.resumeDelay = Duration.zero,
     this.failDebugStreamListen = false,
@@ -1769,12 +1860,15 @@ class FakeVmService extends VmService {
          readyToResumeFailuresBeforeSuccess ?? const {},
        ),
        readyToResumeErrorCodes = readyToResumeErrorCodes ?? const {},
+       readyToResumeLeavesPausedIsolates =
+           readyToResumeLeavesPausedIsolates ?? const {},
        super(const Stream<dynamic>.empty(), (_) {});
 
   final List<IsolateRef> vmIsolates;
   final Map<String, String> pauseEventKinds;
   final bool supportsReadyToResume;
   final Map<String, int> readyToResumeErrorCodes;
+  final Set<String> readyToResumeLeavesPausedIsolates;
   final Duration getIsolateDelay;
   final Duration resumeDelay;
   final bool failDebugStreamListen;
@@ -1867,7 +1961,11 @@ class FakeVmService extends VmService {
       id: isolateId,
       isSystemIsolate: ref.isSystemIsolate,
       pauseEvent: Event(
-        kind: pauseEventKinds[isolateId] ?? EventKind.kPauseStart,
+        kind:
+            pauseEventKinds[isolateId] ??
+            (resumedIsolates.contains(isolateId)
+                ? EventKind.kResume
+                : EventKind.kPauseStart),
         isolate: ref,
       ),
     );
@@ -1906,6 +2004,9 @@ class FakeVmService extends VmService {
     if (failuresRemaining > 0) {
       _readyToResumeFailuresBeforeSuccess[id] = failuresRemaining - 1;
       throw RPCError(method, RPCErrorKind.kServerError.code, 'transient');
+    }
+    if (readyToResumeLeavesPausedIsolates.contains(id)) {
+      return Success();
     }
     await _maybeDelay();
     readyToResumeIsolates.add(id);

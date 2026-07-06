@@ -734,11 +734,28 @@ Future<void> _resumeIsolateWithRetry(
 Future<void> _readyToResumeOrResume(VmService service, String isolateId) async {
   try {
     await service.callMethod('readyToResume', isolateId: isolateId);
+    if (await _isPausedOnStart(service, isolateId)) {
+      await service.resume(isolateId);
+    }
   } on RPCError catch (error) {
     if (error.code != RPCErrorKind.kMethodNotFound.code) {
       rethrow;
     }
     await service.resume(isolateId);
+  }
+}
+
+Future<bool> _isPausedOnStart(VmService service, String isolateId) async {
+  try {
+    final isolate = await service.getIsolate(isolateId);
+    return isolate.pauseEvent?.kind == EventKind.kPauseStart;
+  } on SentinelException {
+    return false;
+  } on RPCError catch (error) {
+    if (_isBenignResumeError(error)) {
+      return false;
+    }
+    rethrow;
   }
 }
 

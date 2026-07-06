@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.0.6
+
+- Fix `loghound run` leaving `--start-paused` Flutter isolates paused when DDS
+  accepts `readyToResume` but keeps the isolate waiting for a user resume.
+  LogHound now verifies the isolate state after `readyToResume` and falls back
+  to `resume` for both startup and worker isolates that are still at
+  `PauseStart`.
+
 ## 0.0.5
 
 - Harden `loghound run` isolate resume handling for `--start-paused` Flutter
