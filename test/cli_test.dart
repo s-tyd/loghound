@@ -1146,6 +1146,84 @@ void main() {
     );
 
     test(
+      'run retries VM service connection while flutter run is still active',
+      () async {
+        final project = Directory('${directory.path}/run-connect-retry');
+        final root = Directory('${directory.path}/run-connect-retry-root');
+        final out = StringBuffer();
+        final err = StringBuffer();
+        final service = FakeVmService(
+          readyToResumeLeavesPausedIsolates: {'main-isolate'},
+        );
+        var connectAttempts = 0;
+
+        final exitCode = await runLogHoundCli(
+          ['run', '--root', root.path],
+          out: out,
+          err: err,
+          currentDirectory: project,
+          processRunner: (command, args, {workingDirectory}) async {
+            await _writeVmServiceUri(args);
+            await service
+                .resumed('main-isolate')
+                .timeout(const Duration(seconds: 1), onTimeout: () {});
+            if (service.resumedIsolates.contains('main-isolate')) {
+              service.extensionEvents.add(_logHoundVmServiceEvent());
+            }
+            await service.extensionEvents.close();
+            await service.debugEvents.close();
+            return 0;
+          },
+          vmServiceConnector: (uri) async {
+            connectAttempts++;
+            if (connectAttempts == 1) {
+              throw const SocketException('Connection refused');
+            }
+            return service;
+          },
+        );
+
+        expect(exitCode, 0);
+        expect(connectAttempts, 2);
+        expect(service.forcedResumedIsolates, contains('main-isolate'));
+        final records = await JsonlLogStore(
+          File('${root.path}/staging/ios/sessions/session-1.jsonl'),
+        ).readAll();
+        expect(records.single, containsPair('name', 'search.submit'));
+      },
+    );
+
+    test(
+      'run stops VM service connection retries when flutter run exits',
+      () async {
+        final project = Directory('${directory.path}/run-connect-never-ready');
+        final root = Directory(
+          '${directory.path}/run-connect-never-ready-root',
+        );
+        final out = StringBuffer();
+        var connectAttempts = 0;
+
+        final exitCode = await runLogHoundCli(
+          ['run', '--root', root.path],
+          out: out,
+          currentDirectory: project,
+          processRunner: (command, args, {workingDirectory}) async {
+            await _writeVmServiceUri(args);
+            await Future<void>.delayed(const Duration(milliseconds: 200));
+            return 0;
+          },
+          vmServiceConnector: (uri) async {
+            connectAttempts++;
+            throw const SocketException('Connection refused');
+          },
+        );
+
+        expect(exitCode, 0);
+        expect(connectAttempts, greaterThanOrEqualTo(1));
+      },
+    );
+
+    test(
       'run ignores isolate-must-be-paused from external resume races',
       () async {
         final project = Directory('${directory.path}/run-resume-race');

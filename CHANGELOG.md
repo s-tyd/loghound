@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.0.7
+
+- Fix `loghound run` abandoning VM Service collection after a transient startup
+  connection failure. While the wrapped `flutter run` process is still active,
+  LogHound now keeps retrying the VM Service connection so `--start-paused`
+  isolates can be resumed once the service accepts WebSocket clients.
+- Stop those retry attempts when the wrapped Flutter process exits, so `run`
+  does not hang if the VM Service never becomes reachable.
+
 ## 0.0.6
 
 - Fix `loghound run` leaving `--start-paused` Flutter isolates paused when DDS

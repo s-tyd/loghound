@@ -481,6 +481,8 @@ Future<int> _runRun(
     vmServiceEventFactory: vmServiceEventFactory,
     vmServiceConnector: vmServiceConnector,
     resumeOnListen: true,
+    keepAlive: injectedEvents == null,
+    stopWhen: injectedEvents == null ? flutterExit.then<void>((_) {}) : null,
   );
   final runExit = await flutterExit;
   if (collectExit != 0) {
@@ -501,6 +503,7 @@ Future<int> _collectVmServiceEvents({
   bool resumeOnListen = false,
   bool keepAlive = false,
   int? maxConnections,
+  Future<void>? stopWhen,
 }) async {
   if ((serviceUri == null || serviceUri.trim().isEmpty) &&
       injectedEvents == null) {
@@ -515,8 +518,20 @@ Future<int> _collectVmServiceEvents({
   var ignored = 0;
   var connections = 0;
   final redactor = LogHoundRedactor();
+  var shouldStop = false;
+  final stopSignal = stopWhen?.then<void>(
+    (_) {
+      shouldStop = true;
+    },
+    onError: (_, _) {
+      shouldStop = true;
+    },
+  );
+  if (stopSignal != null) {
+    unawaited(stopSignal);
+  }
 
-  while (true) {
+  while (!shouldStop) {
     connections++;
     try {
       final events =
@@ -556,10 +571,18 @@ Future<int> _collectVmServiceEvents({
     if (injectedEvents != null || !keepAlive) {
       break;
     }
+    if (shouldStop) {
+      break;
+    }
     if (maxConnections != null && connections >= maxConnections) {
       break;
     }
-    await Future<void>.delayed(const Duration(milliseconds: 250));
+    final retryDelay = Future<void>.delayed(const Duration(milliseconds: 250));
+    if (stopSignal == null) {
+      await retryDelay;
+    } else {
+      await Future.any<void>([retryDelay, stopSignal]);
+    }
   }
 
   final result = <String, Object?>{
