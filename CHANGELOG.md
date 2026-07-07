@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.0.9
+
+- Add `loghound version` to print the installed CLI version and
+  `loghound update` to run `dart pub global activate loghound`.
+- Fix `loghound run` timing out while waiting for `--vmservice-out-file` when
+  the wrapped `flutter run` process is still alive. LogHound now keeps waiting
+  for the VM Service URI file until Flutter exits.
+- Start paused isolate resume setup before Extension stream setup, and finish
+  initial isolate resume before disposing the VM Service if Extension stream
+  setup fails. This avoids leaving `--start-paused` Flutter apps stuck when
+  collector initialization partially fails.
+
 ## 0.0.8
 
 - Fix `loghound run` hanging after the wrapped app exits while the VM Service

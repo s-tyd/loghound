@@ -307,6 +307,56 @@ void main() {
       expect(out.toString(), contains('stats'));
       expect(out.toString(), contains('doctor'));
       expect(out.toString(), contains('setting'));
+      expect(out.toString(), contains('version'));
+      expect(out.toString(), contains('update'));
+    });
+
+    test('version prints the current CLI version', () async {
+      final out = StringBuffer();
+
+      final exitCode = await runLogHoundCli(['version'], out: out);
+
+      expect(exitCode, 0);
+      expect(out.toString().trim(), 'loghound 0.0.9');
+    });
+
+    test('update activates the latest published loghound package', () async {
+      final out = StringBuffer();
+      String? executable;
+      List<String>? arguments;
+      String? capturedWorkingDirectory;
+
+      final exitCode = await runLogHoundCli(
+        ['update'],
+        out: out,
+        processRunner: (command, args, {workingDirectory}) async {
+          executable = command;
+          arguments = args;
+          capturedWorkingDirectory = workingDirectory;
+          return 0;
+        },
+      );
+
+      expect(exitCode, 0);
+      expect(executable, Platform.resolvedExecutable);
+      expect(arguments, ['pub', 'global', 'activate', 'loghound']);
+      expect(capturedWorkingDirectory, isNull);
+      expect(out.toString(), contains('Updated loghound'));
+    });
+
+    test('update returns the pub activation exit code', () async {
+      final out = StringBuffer();
+      final err = StringBuffer();
+
+      final exitCode = await runLogHoundCli(
+        ['update'],
+        out: out,
+        err: err,
+        processRunner: (command, args, {workingDirectory}) async => 69,
+      );
+
+      expect(exitCode, 69);
+      expect(err.toString(), contains('loghound update failed'));
     });
 
     test('doctor fails when no routed sessions are available', () async {
@@ -1194,6 +1244,97 @@ void main() {
     );
 
     test(
+      'run waits for delayed VM service URI while flutter run is still active',
+      () async {
+        final project = Directory('${directory.path}/run-delayed-vm-uri');
+        final root = Directory('${directory.path}/run-delayed-vm-uri-root');
+        final out = StringBuffer();
+        final err = StringBuffer();
+        final runnerDone = Completer<void>();
+        final service = FakeVmService(
+          readyToResumeLeavesPausedIsolates: {'main-isolate'},
+        );
+        addTearDown(() async {
+          if (!runnerDone.isCompleted) {
+            await runnerDone.future.timeout(const Duration(seconds: 1));
+          }
+        });
+
+        final exitCode = await runLogHoundCli(
+          ['run', '--root', root.path],
+          out: out,
+          err: err,
+          currentDirectory: project,
+          processRunner: (command, args, {workingDirectory}) async {
+            try {
+              await Future<void>.delayed(const Duration(milliseconds: 150));
+              await _writeVmServiceUri(args);
+              await service
+                  .resumed('main-isolate')
+                  .timeout(const Duration(milliseconds: 500), onTimeout: () {});
+              if (service.resumedIsolates.contains('main-isolate')) {
+                service.extensionEvents.add(_logHoundVmServiceEvent());
+              }
+              await service.extensionEvents.close();
+              await service.debugEvents.close();
+              return 0;
+            } finally {
+              if (!runnerDone.isCompleted) {
+                runnerDone.complete();
+              }
+            }
+          },
+          vmServiceConnector: (uri) async => service,
+          vmServiceUriFileTimeout: const Duration(milliseconds: 1),
+        );
+
+        expect(exitCode, 0);
+        expect(err.toString(), isNot(contains('Timed out waiting')));
+        expect(service.forcedResumedIsolates, contains('main-isolate'));
+        final records = await JsonlLogStore(
+          File('${root.path}/staging/ios/sessions/session-1.jsonl'),
+        ).readAll();
+        expect(records.single, containsPair('name', 'search.submit'));
+      },
+    );
+
+    test(
+      'run resumes initial isolates when extension stream setup fails',
+      () async {
+        final project = Directory('${directory.path}/run-extension-fails');
+        final root = Directory('${directory.path}/run-extension-fails-root');
+        final out = StringBuffer();
+        final err = StringBuffer();
+        final service = FakeVmService(
+          failExtensionStreamListen: true,
+          readyToResumeLeavesPausedIsolates: {'main-isolate'},
+        );
+
+        final exitCode = await runLogHoundCli(
+          ['run', '--root', root.path],
+          out: out,
+          err: err,
+          currentDirectory: project,
+          processRunner: (command, args, {workingDirectory}) async {
+            await _writeVmServiceUri(args);
+            await service
+                .resumed('main-isolate')
+                .timeout(const Duration(milliseconds: 500), onTimeout: () {});
+            await service.extensionEvents.close();
+            await service.debugEvents.close();
+            return 0;
+          },
+          vmServiceConnector: (uri) async => service,
+        );
+
+        expect(exitCode, 0);
+        expect(service.listenedStreams, contains(EventStreams.kExtension));
+        expect(err.toString(), contains('VM Service connection failed'));
+        expect(service.forcedResumedIsolates, contains('main-isolate'));
+      },
+    );
+
+    test(
       'run stops VM service connection retries when flutter run exits',
       () async {
         final project = Directory('${directory.path}/run-connect-never-ready');
@@ -1929,6 +2070,7 @@ class FakeVmService extends VmService {
     Set<String>? readyToResumeLeavesPausedIsolates,
     this.getIsolateDelay = Duration.zero,
     this.resumeDelay = Duration.zero,
+    this.failExtensionStreamListen = false,
     this.failDebugStreamListen = false,
     this.debugEventDuringDebugStreamListen,
     this.failResumeIfDisposed = false,
@@ -1949,6 +2091,7 @@ class FakeVmService extends VmService {
   final Set<String> readyToResumeLeavesPausedIsolates;
   final Duration getIsolateDelay;
   final Duration resumeDelay;
+  final bool failExtensionStreamListen;
   final bool failDebugStreamListen;
   final Event? debugEventDuringDebugStreamListen;
   final bool failResumeIfDisposed;
@@ -2005,6 +2148,13 @@ class FakeVmService extends VmService {
   @override
   Future<Success> streamListen(String streamId) async {
     listenedStreams.add(streamId);
+    if (streamId == EventStreams.kExtension && failExtensionStreamListen) {
+      throw RPCError(
+        'streamListen',
+        RPCErrorKind.kServerError.code,
+        'extension stream failed',
+      );
+    }
     if (streamId == EventStreams.kDebug && failDebugStreamListen) {
       throw RPCError(
         'streamListen',

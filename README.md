@@ -42,6 +42,8 @@ For a short global command:
 
 ```bash
 dart pub global activate loghound
+loghound version
+loghound update
 ```
 
 ## Quick Start
@@ -139,6 +141,8 @@ logs.send({
 ## CLI
 
 ```bash
+loghound version                            # installed CLI version
+loghound update                             # update global activation
 loghound run                                # flutter run + hidden collector
 loghound stay                                # hidden collector only
 loghound apps

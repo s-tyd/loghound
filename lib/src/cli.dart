@@ -21,6 +21,9 @@ const _defaultLogRoot = '.loghound';
 const _legacyLogRoot = 'loghound';
 const _defaultVmServiceUriFile = '.dart_tool/loghound/vm-service-url';
 
+/// The version reported by `loghound version`.
+const logHoundCliVersion = '0.0.9';
+
 /// Starts a subprocess and returns its eventual exit code.
 typedef LogHoundProcessRunner =
     Future<int> Function(
@@ -88,6 +91,10 @@ Future<int> runLogHoundCli(
   }
 
   switch (command.name) {
+    case 'version':
+      return _runVersion(output);
+    case 'update':
+      return _runUpdate(output, errors, processRunner ?? _defaultProcessRunner);
     case 'apps':
       return _runApps(command, output);
     case 'sessions':
@@ -151,6 +158,8 @@ ArgParser _buildParser() {
       'apps',
       ArgParser()..addOption('root', defaultsTo: _defaultLogRoot),
     )
+    ..addCommand('version')
+    ..addCommand('update')
     ..addCommand('sessions', _withRouteOptions(ArgParser(), includeFile: false))
     ..addCommand('stay', _buildStayParser())
     ..addCommand('run', _buildRunParser())
@@ -294,6 +303,37 @@ ArgParser _withRouteOptions(ArgParser parser, {bool includeFile = true}) {
     ..addOption('session');
 }
 
+Future<int> _runVersion(StringSink output) async {
+  output.writeln('loghound $logHoundCliVersion');
+  return 0;
+}
+
+Future<int> _runUpdate(
+  StringSink output,
+  StringSink errors,
+  LogHoundProcessRunner processRunner,
+) async {
+  output.writeln('Updating loghound...');
+  int exitCode;
+  try {
+    exitCode = await processRunner(io.Platform.resolvedExecutable, const [
+      'pub',
+      'global',
+      'activate',
+      'loghound',
+    ]);
+  } on Object catch (error) {
+    errors.writeln('loghound update failed: $error');
+    return 1;
+  }
+  if (exitCode != 0) {
+    errors.writeln('loghound update failed with exit code $exitCode.');
+    return exitCode;
+  }
+  output.writeln('Updated loghound.');
+  return 0;
+}
+
 Future<int> _runApps(ArgResults command, StringSink output) async {
   final apps = await LogHoundDirectoryStore(
     _readRootDirectory(command['root'] as String),
@@ -419,22 +459,12 @@ Future<int> _runRun(
     return 1;
   }
 
-  final uriErrors = StringBuffer();
-  final startup =
-      await Future.any<({String kind, String? serviceUri, int? exitCode})>([
-        _resolveVmServiceUri(
-          explicitUri: null,
-          uriFilePath: uriFile.path,
-          currentDirectory: currentDirectory,
-          timeout: vmServiceUriFileTimeout ?? const Duration(seconds: 60),
-          errors: uriErrors,
-        ).then((uri) => (kind: 'uri', serviceUri: uri, exitCode: null)),
-        flutterExit.then(
-          (exitCode) => (kind: 'exit', serviceUri: null, exitCode: exitCode),
-        ),
-      ]);
-  if (startup.kind == 'exit') {
-    final exitCode = startup.exitCode!;
+  final startup = await _waitForRunVmServiceUri(
+    uriFile: uriFile,
+    flutterExit: flutterExit,
+    initialTimeout: vmServiceUriFileTimeout ?? const Duration(seconds: 60),
+  );
+  if (startup.exitCode case final exitCode?) {
     if (exitCode != 0) {
       return exitCode;
     }
@@ -467,7 +497,9 @@ Future<int> _runRun(
 
   final serviceUri = startup.serviceUri;
   if (serviceUri == null) {
-    errors.write(uriErrors.toString());
+    errors.writeln(
+      'Timed out waiting for VM Service URI file: ${uriFile.path}',
+    );
     return 64;
   }
 
@@ -649,8 +681,8 @@ Stream<LogHoundVmServiceEvent> _vmServiceEvents(
   final service = await (vmServiceConnector ?? vmServiceConnectUri)(wsUri);
   StreamSubscription<Event>? debugSubscription;
   final resumeState = _ResumeState();
+  Future<void>? initialResume;
   try {
-    await service.streamListen(EventStreams.kExtension);
     if (resumeOnListen) {
       debugSubscription = service.onDebugEvent.listen((event) {
         unawaited(
@@ -662,7 +694,16 @@ Stream<LogHoundVmServiceEvent> _vmServiceEvents(
       } on Object catch (error) {
         errors.writeln('Failed to set up paused isolate resume: $error');
       }
-      unawaited(_resumeInitialAppIsolates(service, errors, resumeState));
+      initialResume = _resumeInitialAppIsolates(service, errors, resumeState);
+      unawaited(initialResume);
+    }
+    try {
+      await service.streamListen(EventStreams.kExtension);
+    } on Object {
+      if (initialResume != null) {
+        await initialResume;
+      }
+      rethrow;
     }
     errors.writeln('loghound collecting from $serviceUri');
     await for (final event in service.onExtensionEvent) {
@@ -1559,6 +1600,46 @@ class _VmServiceUriResolution {
   }
 }
 
+Future<({String? serviceUri, int? exitCode})> _waitForRunVmServiceUri({
+  required io.File uriFile,
+  required Future<int> flutterExit,
+  required Duration initialTimeout,
+}) async {
+  var flutterExited = false;
+  int? flutterExitCode;
+  final exitSignal = flutterExit.then<void>((exitCode) {
+    flutterExited = true;
+    flutterExitCode = exitCode;
+  });
+  unawaited(exitSignal);
+
+  final started = DateTime.now();
+  var initialDeadlinePassed = initialTimeout <= Duration.zero;
+  while (true) {
+    final uri = await _tryReadVmServiceUriFromFile(uriFile);
+    if (uri != null) {
+      return (serviceUri: uri, exitCode: null);
+    }
+    if (flutterExited) {
+      return (serviceUri: null, exitCode: flutterExitCode ?? 0);
+    }
+
+    var delay = const Duration(milliseconds: 100);
+    if (!initialDeadlinePassed) {
+      final elapsed = DateTime.now().difference(started);
+      if (elapsed >= initialTimeout) {
+        initialDeadlinePassed = true;
+      } else {
+        final remaining = initialTimeout - elapsed;
+        if (remaining < delay) {
+          delay = remaining;
+        }
+      }
+    }
+    await Future.any<void>([Future<void>.delayed(delay), exitSignal]);
+  }
+}
+
 Future<String?> _resolveVmServiceUri({
   required String? explicitUri,
   required String? uriFilePath,
@@ -1592,17 +1673,23 @@ Future<String> _readVmServiceUriFromFile(
 }) async {
   final started = DateTime.now();
   while (true) {
-    if (await file.exists()) {
-      final text = (await file.readAsString()).trim();
-      if (text.isNotEmpty) {
-        return text;
-      }
+    final uri = await _tryReadVmServiceUriFromFile(file);
+    if (uri != null) {
+      return uri;
     }
     if (timeout != null && DateTime.now().difference(started) >= timeout) {
       throw TimeoutException('Timed out waiting for ${file.path}', timeout);
     }
     await Future<void>.delayed(const Duration(milliseconds: 100));
   }
+}
+
+Future<String?> _tryReadVmServiceUriFromFile(io.File file) async {
+  if (!await file.exists()) {
+    return null;
+  }
+  final text = (await file.readAsString()).trim();
+  return text.isEmpty ? null : text;
 }
 
 String _resolvePath(io.Directory currentDirectory, String path) {
@@ -2169,6 +2256,8 @@ String _usage(ArgParser parser) {
 Usage: loghound <command> [options]
 
 Commands:
+  version        Print the installed loghound CLI version
+  update         Update the globally activated loghound package
   run            Run Flutter and collect hidden loghound VM Service events
   stay           Keep collecting hidden loghound VM Service events
   apps           List discovered apps
