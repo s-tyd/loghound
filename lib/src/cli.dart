@@ -549,17 +549,33 @@ Future<int> _collectVmServiceEvents({
                   resumeOnListen: resumeOnListen,
                 ));
 
-      await for (final event in events) {
-        final record = logHoundDecodeVmServiceEvent(
-          event,
-          eventKind: eventKind,
-        );
-        if (record == null) {
-          ignored++;
-          continue;
+      final iterator = StreamIterator(events);
+      try {
+        while (true) {
+          final result = await _moveNextOrStop(iterator, stopSignal);
+          if (result == _EventStreamResult.stopped) {
+            unawaited(iterator.cancel());
+            break;
+          }
+          if (result == _EventStreamResult.done) {
+            break;
+          }
+
+          final record = logHoundDecodeVmServiceEvent(
+            iterator.current,
+            eventKind: eventKind,
+          );
+          if (record == null) {
+            ignored++;
+            continue;
+          }
+          await store.append(_redactRecord(record, redactor));
+          records++;
         }
-        await store.append(_redactRecord(record, redactor));
-        records++;
+      } finally {
+        if (shouldStop) {
+          unawaited(iterator.cancel());
+        }
       }
     } on Object catch (error) {
       errors.writeln('VM Service connection failed: $error');
@@ -596,6 +612,24 @@ Future<int> _collectVmServiceEvents({
 
   _writeRecord(output, result);
   return 0;
+}
+
+enum _EventStreamResult { event, done, stopped }
+
+Future<_EventStreamResult> _moveNextOrStop<T>(
+  StreamIterator<T> iterator,
+  Future<void>? stopWhen,
+) {
+  final moveNext = iterator.moveNext().then(
+    (hasEvent) => hasEvent ? _EventStreamResult.event : _EventStreamResult.done,
+  );
+  if (stopWhen == null) {
+    return moveNext;
+  }
+  return Future.any<_EventStreamResult>([
+    moveNext,
+    stopWhen.then((_) => _EventStreamResult.stopped),
+  ]);
 }
 
 Map<String, Object?> _redactRecord(

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.0.8
+
+- Fix `loghound run` hanging after the wrapped app exits while the VM Service
+  extension stream is still awaiting events. Collection now races active stream
+  reads against the wrapped process exit signal and stops cleanly.
+- Add a real Dart VM Service regression test that starts a `--pause-isolates-on-start`
+  app, injects a transient startup connection failure, resumes both the main
+  isolate and a worker isolate named like an asset UTF8 decoder, and verifies
+  that a `.loghound` session record is written.
+
 ## 0.0.7
 
 - Fix `loghound run` abandoning VM Service collection after a transient startup
