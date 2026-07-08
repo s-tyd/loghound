@@ -150,15 +150,33 @@ loghound sessions --flavor staging
 loghound doctor --flavor staging --platform ios
 loghound query --contains purchase
 loghound tail --flavor staging --platform ios
+loghound http list --flavor staging --platform ios --session session-1 --path /api/pages/me/messages --limit 20
+loghound http summary --flavor staging --platform ios --session session-1
 loghound latest-error --flavor staging
 loghound context --flavor staging --latest-error
+loghound context --flavor staging --platform ios --session session-1 --around-http /api/pages/me/messages
 ```
 
 `doctor` reports whether routed logs are ready for AI investigation: sessions,
 records, screen/action/http/error counts, HTTP body capture, stale records when
-`--max-age-minutes` is passed, and actionable warnings. `query`, `latest-error`,
-and `context` understand common OpenTelemetry fields such as `severity_number`,
-`severity_text`, `body`, `attributes`, `trace_id`, and `span_id`.
+`--max-age-minutes` is passed, and actionable warnings. When HTTP records exist
+but bodies are missing, `doctor` reports the body-capture settings and Flutter
+launch flags to check. `query`, `latest-error`, and `context` understand common
+OpenTelemetry fields such as `severity_number`, `severity_text`, `body`,
+`attributes`, `trace_id`, and `span_id`.
+
+HTTP investigation commands can stay narrow without shell `rg`:
+
+```bash
+loghound http list --session session-1 --path /api/pages/me/messages --method GET --status 200 --limit 20
+loghound http list --session session-1 --contains official_information --since 2026-07-09T02:00:00
+loghound http summary --session session-1
+loghound context --session session-1 --around-http /api/pages/me/messages --before 20 --after 10
+```
+
+`http list` summaries include `request_body_captured` and
+`response_body_captured`, so `response_body_bytes:0` is not confused with a
+captured empty response.
 
 ## HTTP And Action Capture
 
@@ -208,11 +226,23 @@ Then pass the settings into Flutter, for example:
 
 ```bash
 loghound run --flavor dev --dart-define-from-file=.env
+flutter run --dart-define=LOGHOUND_CAPTURE_HTTP_RESPONSE_BODY=true
 ```
 
 The same policy is visible in `loghound setting` as
 `capture_http_request_body` and `capture_http_response_body`, so an AI agent can
 notice when HTTP bodies are expected but missing from the logs.
+
+If `loghound doctor` reports `no_http_bodies`, enable the expected policy and
+launch the app with matching Dart defines:
+
+```bash
+loghound setting capture_http_response_body true
+loghound setting capture_http_request_body true
+loghound run --flavor dev --dart-define-from-file=.env
+flutter run --dart-define=LOGHOUND_CAPTURE_HTTP_RESPONSE_BODY=true
+flutter run --dart-define=LOGHOUND_CAPTURE_HTTP_REQUEST_BODY=true
+```
 
 HTTP helper bodies are redacted before printing and are capped by default:
 request bodies at 64 KB and response bodies at 256 KB. Truncated records keep

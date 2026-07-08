@@ -3,7 +3,7 @@ description: >-
   AI-friendly local log investigation harness for Dart and Flutter: collect
   structured app logs, store them as JSON Lines, and query the exact slice you
   need.
-version: 0.0.9
+version: 0.0.10
 repository: https://github.com/s-tyd/loghound
 issue_tracker: https://github.com/s-tyd/loghound/issues
 topics:

@@ -270,6 +270,99 @@ void main() {
       expect(text, contains('Error: empty title rendered'));
     });
 
+    test('context builds timeline around a matching HTTP record', () async {
+      final root = Directory('${directory.path}/context-around-http');
+      final routedStore = JsonlLogStore(
+        File('${root.path}/dev/ios/sessions/session-1.jsonl'),
+      );
+      await routedStore.append({
+        'timestamp': '2026-07-09T02:02:00.000',
+        'app_id': 'guide-app',
+        'flavor': 'dev',
+        'platform': 'ios',
+        'session_id': 'session-1',
+        'kind': 'screen',
+        'name': 'screen.view',
+        'screen': 'LoginRoute',
+        'route': '/login',
+      });
+      await routedStore.append({
+        'timestamp': '2026-07-09T02:03:00.000',
+        'app_id': 'guide-app',
+        'flavor': 'dev',
+        'platform': 'ios',
+        'session_id': 'session-1',
+        'kind': 'screen',
+        'name': 'screen.view',
+        'screen': 'NewsRoute',
+        'route': '/news',
+      });
+      await routedStore.append({
+        'timestamp': '2026-07-09T02:03:30.000',
+        'app_id': 'guide-app',
+        'flavor': 'dev',
+        'platform': 'ios',
+        'session_id': 'session-1',
+        'kind': 'action',
+        'name': 'news.tab.select',
+        'screen': 'NewsRoute',
+        'data': {'tab': 'official_information'},
+      });
+      await routedStore.append({
+        'timestamp': '2026-07-09T02:04:00.000',
+        'app_id': 'guide-app',
+        'flavor': 'dev',
+        'platform': 'ios',
+        'session_id': 'session-1',
+        'kind': 'http',
+        'request_id': 'messages-official',
+        'method': 'GET',
+        'url':
+            'https://api.example.test/api/pages/me/messages?notification_type=official_information',
+        'path': '/api/pages/me/messages',
+        'status': 200,
+        'duration_ms': 72,
+      });
+      await routedStore.append({
+        'timestamp': '2026-07-09T02:05:00.000',
+        'app_id': 'guide-app',
+        'flavor': 'dev',
+        'platform': 'ios',
+        'session_id': 'session-1',
+        'kind': 'error',
+        'level': 900,
+        'message': 'image missing',
+      });
+
+      final out = StringBuffer();
+      final exitCode = await runLogHoundCli([
+        'context',
+        '--root',
+        root.path,
+        '--flavor',
+        'dev',
+        '--platform',
+        'ios',
+        '--session',
+        'session-1',
+        '--around-http',
+        '/api/pages/me/messages',
+        '--before',
+        '2',
+        '--after',
+        '1',
+      ], out: out);
+
+      expect(exitCode, 0);
+      final text = out.toString();
+      expect(text, contains('## Anchor Record'));
+      expect(text, contains('NewsRoute'));
+      expect(text, contains('news.tab.select'));
+      expect(text, contains('/api/pages/me/messages'));
+      expect(text, contains('image missing'));
+      expect(text, isNot(contains('LoginRoute')));
+    });
+
     test('context respects max chars', () async {
       final out = StringBuffer();
 
@@ -311,13 +404,39 @@ void main() {
       expect(out.toString(), contains('update'));
     });
 
+    test(
+      'subcommand help shows command-specific options and examples',
+      () async {
+        final tailOut = StringBuffer();
+        final tailExit = await runLogHoundCli(['tail', '--help'], out: tailOut);
+
+        expect(tailExit, 0);
+        expect(tailOut.toString(), contains('Usage: loghound tail'));
+        expect(tailOut.toString(), contains('--count'));
+        expect(tailOut.toString(), contains('Examples:'));
+
+        final httpOut = StringBuffer();
+        final httpExit = await runLogHoundCli([
+          'http',
+          'list',
+          '--help',
+        ], out: httpOut);
+
+        expect(httpExit, 0);
+        expect(httpOut.toString(), contains('Usage: loghound http list'));
+        expect(httpOut.toString(), contains('--path'));
+        expect(httpOut.toString(), contains('--limit'));
+        expect(httpOut.toString(), contains('Examples:'));
+      },
+    );
+
     test('version prints the current CLI version', () async {
       final out = StringBuffer();
 
       final exitCode = await runLogHoundCli(['version'], out: out);
 
       expect(exitCode, 0);
-      expect(out.toString().trim(), 'loghound 0.0.9');
+      expect(out.toString().trim(), 'loghound 0.0.10');
     });
 
     test('update activates the latest published loghound package', () async {
@@ -451,7 +570,82 @@ void main() {
       expect(report, containsPair('http_records', 1));
       expect(report, containsPair('error_records', 1));
       expect(report, containsPair('http_body_records', 1));
+      expect(report, containsPair('http_request_body_records', 0));
+      expect(report, containsPair('http_response_body_records', 1));
       expect(report, containsPair('issues', isEmpty));
+    });
+
+    test('doctor explains how to enable missing HTTP body capture', () async {
+      final root = Directory('${directory.path}/doctor-http-body-guidance');
+      final routedStore = LogHoundDirectoryStore(root);
+      await routedStore.append({
+        'timestamp': '2026-07-09T02:00:00.000',
+        'app_id': 'guide-app',
+        'flavor': 'dev',
+        'platform': 'ios',
+        'session_id': 'session-1',
+        'kind': 'screen',
+        'name': 'screen.view',
+        'screen': 'NewsRoute',
+      });
+      await routedStore.append({
+        'timestamp': '2026-07-09T02:01:00.000',
+        'app_id': 'guide-app',
+        'flavor': 'dev',
+        'platform': 'ios',
+        'session_id': 'session-1',
+        'kind': 'action',
+        'name': 'news.refresh',
+      });
+      await routedStore.append({
+        'timestamp': '2026-07-09T02:02:00.000',
+        'app_id': 'guide-app',
+        'flavor': 'dev',
+        'platform': 'ios',
+        'session_id': 'session-1',
+        'kind': 'http',
+        'request_id': 'messages-official',
+        'method': 'GET',
+        'url': '/api/pages/me/messages?notification_type=official_information',
+        'path': '/api/pages/me/messages',
+        'status': 200,
+      });
+
+      final out = StringBuffer();
+      final exitCode = await runLogHoundCli([
+        'doctor',
+        '--root',
+        root.path,
+        '--flavor',
+        'dev',
+        '--platform',
+        'ios',
+        '--session',
+        'session-1',
+      ], out: out);
+
+      expect(exitCode, 0);
+      final report = jsonDecode(out.toString().trim()) as Map<String, Object?>;
+      expect(report, containsPair('status', 'warn'));
+      expect(report, containsPair('http_request_body_records', 0));
+      expect(report, containsPair('http_response_body_records', 0));
+      final issues = (report['issues'] as List<Object?>)
+          .cast<Map<String, Object?>>();
+      final issue = issues.singleWhere(
+        (candidate) => candidate['code'] == 'no_http_bodies',
+      );
+      expect(
+        issue['message'],
+        contains('request/response bodies are not captured'),
+      );
+      expect(
+        issue['next_steps'],
+        contains('loghound setting capture_http_response_body true'),
+      );
+      expect(
+        issue['next_steps'],
+        contains('--dart-define=LOGHOUND_CAPTURE_HTTP_RESPONSE_BODY=true'),
+      );
     });
 
     test('removed collection commands are rejected', () async {
@@ -1956,6 +2150,8 @@ void main() {
         expect(httpSummary, containsPair('request_id', 'req-1'));
         expect(httpSummary, containsPair('method', 'GET'));
         expect(httpSummary, containsPair('status', 200));
+        expect(httpSummary, containsPair('request_body_captured', false));
+        expect(httpSummary, containsPair('response_body_captured', true));
         expect(httpSummary, isNot(contains('response_body')));
 
         final bodyOut = StringBuffer();
@@ -2000,6 +2196,189 @@ void main() {
         expect(stats, containsPair('action_records', 1));
       },
     );
+
+    test('http list filters routed records without rg', () async {
+      final root = Directory('${directory.path}/http-list-filters');
+      final routedStore = JsonlLogStore(
+        File('${root.path}/dev/ios/sessions/session-1.jsonl'),
+      );
+      await routedStore.append({
+        'timestamp': '2026-07-09T01:59:59.000',
+        'app_id': 'guide-app',
+        'flavor': 'dev',
+        'platform': 'ios',
+        'session_id': 'session-1',
+        'kind': 'http',
+        'request_id': 'too-early',
+        'method': 'GET',
+        'url':
+            'https://api.example.test/api/pages/me/messages?notification_type=official_information',
+        'path': '/api/pages/me/messages',
+        'status': 200,
+      });
+      await routedStore.append({
+        'timestamp': '2026-07-09T02:04:00.000',
+        'app_id': 'guide-app',
+        'flavor': 'dev',
+        'platform': 'ios',
+        'session_id': 'session-1',
+        'kind': 'http',
+        'request_id': 'messages-official',
+        'method': 'GET',
+        'url':
+            'https://api.example.test/api/pages/me/messages?notification_type=official_information',
+        'path': '/api/pages/me/messages',
+        'status': 200,
+        'duration_ms': 72,
+      });
+      await routedStore.append({
+        'timestamp': '2026-07-09T02:05:00.000',
+        'app_id': 'guide-app',
+        'flavor': 'dev',
+        'platform': 'ios',
+        'session_id': 'session-1',
+        'kind': 'http',
+        'request_id': 'wrong-method',
+        'method': 'POST',
+        'url':
+            'https://api.example.test/api/pages/me/messages?notification_type=official_information',
+        'path': '/api/pages/me/messages',
+        'status': 200,
+      });
+      await routedStore.append({
+        'timestamp': '2026-07-09T02:06:00.000',
+        'app_id': 'guide-app',
+        'flavor': 'dev',
+        'platform': 'ios',
+        'session_id': 'session-1',
+        'kind': 'http',
+        'request_id': 'wrong-path',
+        'method': 'GET',
+        'url': 'https://api.example.test/api/me/profile',
+        'path': '/api/me/profile',
+        'status': 200,
+      });
+
+      final out = StringBuffer();
+      final exitCode = await runLogHoundCli([
+        'http',
+        'list',
+        '--root',
+        root.path,
+        '--flavor',
+        'dev',
+        '--platform',
+        'ios',
+        '--session',
+        'session-1',
+        '--path',
+        '/api/pages/me/messages',
+        '--method',
+        'get',
+        '--status',
+        '200',
+        '--since',
+        '2026-07-09T02:00:00.000',
+        '--until',
+        '2026-07-09T02:10:00.000',
+        '--contains',
+        'official_information',
+        '--limit',
+        '1',
+      ], out: out);
+
+      expect(exitCode, 0);
+      final lines = out.toString().trim().split('\n');
+      expect(lines, hasLength(1));
+      final summary = jsonDecode(lines.single) as Map<String, Object?>;
+      expect(summary, containsPair('request_id', 'messages-official'));
+      expect(summary, containsPair('request_body_captured', false));
+      expect(summary, containsPair('response_body_captured', false));
+      expect(out.toString(), isNot(contains('too-early')));
+      expect(out.toString(), isNot(contains('wrong-method')));
+      expect(out.toString(), isNot(contains('wrong-path')));
+    });
+
+    test('http summary groups routed HTTP records by endpoint', () async {
+      final root = Directory('${directory.path}/http-summary');
+      final routedStore = JsonlLogStore(
+        File('${root.path}/dev/ios/sessions/session-1.jsonl'),
+      );
+      await routedStore.append({
+        'timestamp': '2026-07-09T02:04:00.000',
+        'app_id': 'guide-app',
+        'flavor': 'dev',
+        'platform': 'ios',
+        'session_id': 'session-1',
+        'kind': 'http',
+        'request_id': 'messages-ok',
+        'method': 'GET',
+        'url':
+            'https://api.example.test/api/pages/me/messages?notification_type=official_information',
+        'path': '/api/pages/me/messages',
+        'status': 200,
+        'duration_ms': 100,
+      });
+      await routedStore.append({
+        'timestamp': '2026-07-09T02:05:00.000',
+        'app_id': 'guide-app',
+        'flavor': 'dev',
+        'platform': 'ios',
+        'session_id': 'session-1',
+        'kind': 'http',
+        'request_id': 'messages-failed',
+        'method': 'GET',
+        'url':
+            'https://api.example.test/api/pages/me/messages?notification_type=official_information',
+        'path': '/api/pages/me/messages',
+        'status': 500,
+        'duration_ms': 200,
+      });
+      await routedStore.append({
+        'timestamp': '2026-07-09T02:06:00.000',
+        'app_id': 'guide-app',
+        'flavor': 'dev',
+        'platform': 'ios',
+        'session_id': 'session-1',
+        'kind': 'http',
+        'request_id': 'profile-ok',
+        'method': 'GET',
+        'url': 'https://api.example.test/api/me/profile',
+        'path': '/api/me/profile',
+        'status': 200,
+        'duration_ms': 50,
+      });
+
+      final out = StringBuffer();
+      final exitCode = await runLogHoundCli([
+        'http',
+        'summary',
+        '--root',
+        root.path,
+        '--flavor',
+        'dev',
+        '--platform',
+        'ios',
+        '--session',
+        'session-1',
+      ], out: out);
+
+      expect(exitCode, 0);
+      final summaries = out
+          .toString()
+          .trim()
+          .split('\n')
+          .map((line) => jsonDecode(line) as Map<String, Object?>)
+          .toList();
+      final messages = summaries.singleWhere(
+        (summary) => summary['endpoint'] == 'GET /api/pages/me/messages',
+      );
+      expect(messages, containsPair('count', 2));
+      expect(messages, containsPair('latest_at', '2026-07-09T02:05:00.000'));
+      expect(messages, containsPair('average_duration_ms', 150));
+      expect(messages, containsPair('failures', 1));
+      expect(messages['statuses'], {'200': 1, '500': 1});
+    });
   });
 }
 

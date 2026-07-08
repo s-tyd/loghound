@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.0.10
+
+- Add HTTP investigation filters to `loghound http list`: `--path`,
+  `--method`, `--status`, `--since`, `--until`, `--limit`, and `--contains`.
+- Add `loghound http summary` for endpoint-level counts, latest timestamps,
+  statuses, average duration, and failure counts.
+- Add `loghound context --around-http <path-or-url-fragment>` to build
+  timeline context around a matching HTTP request.
+- Improve HTTP summaries and `doctor` body coverage by reporting whether
+  request/response bodies were captured separately.
+- Improve subcommand help output with command-specific usage, options, and
+  examples.
+- Document the HTTP investigation workflow and body-capture guidance.
+
 ## 0.0.9
 
 - Add `loghound version` to print the installed CLI version and

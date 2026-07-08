@@ -22,7 +22,7 @@ const _legacyLogRoot = 'loghound';
 const _defaultVmServiceUriFile = '.dart_tool/loghound/vm-service-url';
 
 /// The version reported by `loghound version`.
-const logHoundCliVersion = '0.0.9';
+const logHoundCliVersion = '0.0.10';
 
 /// Starts a subprocess and returns its eventual exit code.
 typedef LogHoundProcessRunner =
@@ -80,8 +80,10 @@ Future<int> runLogHoundCli(
   }
 
   final command = results.command;
-  if (results['help'] == true || (command == null && args.isEmpty)) {
-    output.writeln(_usage(parser));
+  if (_isHelpArg(args) || (command == null && args.isEmpty)) {
+    output.writeln(
+      command == null ? _usage(parser) : _commandUsage(_commandPath(command)),
+    );
     return 0;
   }
   if (command == null) {
@@ -194,6 +196,7 @@ ArgParser _buildParser() {
             negatable: false,
             help: 'Build context around the latest warning/error record.',
           )
+          ..addOption('around-http')
           ..addOption('before', defaultsTo: '50')
           ..addOption('after', defaultsTo: '20')
           ..addOption('max-lines', defaultsTo: '200')
@@ -209,7 +212,8 @@ ArgParser _buildParser() {
     ..addCommand(
       'http',
       ArgParser()
-        ..addCommand('list', _withRouteOptions(ArgParser()))
+        ..addCommand('list', _buildHttpFilterParser())
+        ..addCommand('summary', _buildHttpFilterParser())
         ..addCommand(
           'show',
           _withRouteOptions(ArgParser()..addOption('request-id')),
@@ -289,6 +293,19 @@ ArgParser _buildRunParser() {
 
 ArgParser _buildSettingParser() {
   return ArgParser()..addOption('root', defaultsTo: _defaultLogRoot);
+}
+
+ArgParser _buildHttpFilterParser() {
+  return _withRouteOptions(
+    ArgParser()
+      ..addOption('path')
+      ..addOption('method')
+      ..addOption('status')
+      ..addOption('since')
+      ..addOption('until')
+      ..addOption('limit')
+      ..addOption('contains'),
+  );
 }
 
 ArgParser _withRouteOptions(ArgParser parser, {bool includeFile = true}) {
@@ -917,8 +934,11 @@ Future<int> _runLatestError(ArgResults command, StringSink output) async {
 
 Future<int> _runContext(ArgResults command, StringSink output) async {
   final records = await _recordsFor(command);
-  final latestIndex = _latestErrorIndex(records);
-  if (latestIndex == -1) {
+  final aroundHttp = command['around-http'] as String?;
+  final anchorIndex = aroundHttp == null || aroundHttp.isEmpty
+      ? _latestErrorIndex(records)
+      : _latestHttpIndex(records, aroundHttp);
+  if (anchorIndex == -1) {
     return 1;
   }
 
@@ -928,14 +948,15 @@ Future<int> _runContext(ArgResults command, StringSink output) async {
   final maxChars = math.max(0, int.parse(command['max-chars'] as String));
   final relatedIndexes = _relatedContextIndexes(
     records,
-    latestIndex,
+    anchorIndex,
     before,
     after,
+    includeSessionId: aroundHttp == null || aroundHttp.isEmpty,
   );
   final window = [for (final index in relatedIndexes) records[index]];
   final related = _limitAroundLatest(
     window,
-    relatedIndexes.indexOf(latestIndex),
+    relatedIndexes.indexOf(anchorIndex),
     maxLines,
   );
   final omitted = window.length - related.length;
@@ -949,7 +970,10 @@ Future<int> _runContext(ArgResults command, StringSink output) async {
     'jsonl' => _formatJsonLines(related),
     _ => _formatMarkdownContext(
       source: _sourceLabel(command),
-      latest: records[latestIndex],
+      latest: records[anchorIndex],
+      anchorHeading: aroundHttp == null || aroundHttp.isEmpty
+          ? 'Latest Error'
+          : 'Anchor Record',
       related: related,
       omitted: omitted,
     ),
@@ -983,8 +1007,15 @@ Future<int> _runHttp(
   final httpRecords = records.where(_isHttpRecord);
   switch (subcommand.name) {
     case 'list':
-      for (final record in httpRecords) {
+      for (final record in _filterHttpRecords(httpRecords, subcommand)) {
         _writeRecord(output, _httpSummary(record));
+      }
+      return 0;
+    case 'summary':
+      for (final summary in _httpEndpointSummaries(
+        _filterHttpRecords(httpRecords, subcommand),
+      )) {
+        _writeRecord(output, summary);
       }
       return 0;
     case 'show':
@@ -1127,6 +1158,8 @@ Future<int> _runDoctor(ArgResults command, StringSink output) async {
   var httpRecords = 0;
   var errorRecords = 0;
   var httpBodyRecords = 0;
+  var httpRequestBodyRecords = 0;
+  var httpResponseBodyRecords = 0;
   for (final record in records) {
     final kind = _recordKind(record);
     byKind[kind] = (byKind[kind] ?? 0) + 1;
@@ -1136,7 +1169,15 @@ Future<int> _runDoctor(ArgResults command, StringSink output) async {
       actionRecords++;
     } else if (kind == 'http') {
       httpRecords++;
-      if (_requestBody(record) != null || _responseBody(record) != null) {
+      final requestBody = _requestBody(record);
+      final responseBody = _responseBody(record);
+      if (requestBody != null) {
+        httpRequestBodyRecords++;
+      }
+      if (responseBody != null) {
+        httpResponseBodyRecords++;
+      }
+      if (requestBody != null || responseBody != null) {
         httpBodyRecords++;
       }
     } else if (kind == 'error') {
@@ -1173,6 +1214,13 @@ Future<int> _runDoctor(ArgResults command, StringSink output) async {
         'code': 'no_http_bodies',
         'message':
             'HTTP records exist, but request/response bodies are not captured.',
+        'next_steps': [
+          'loghound setting capture_http_response_body true',
+          'loghound setting capture_http_request_body true',
+          '--dart-define=LOGHOUND_CAPTURE_HTTP_RESPONSE_BODY=true',
+          '--dart-define=LOGHOUND_CAPTURE_HTTP_REQUEST_BODY=true',
+          '--dart-define-from-file=.env',
+        ],
       });
     }
   }
@@ -1209,6 +1257,8 @@ Future<int> _runDoctor(ArgResults command, StringSink output) async {
     'http_records': httpRecords,
     'error_records': errorRecords,
     'http_body_records': httpBodyRecords,
+    'http_request_body_records': httpRequestBodyRecords,
+    'http_response_body_records': httpResponseBodyRecords,
     'by_kind': byKind,
     if (latestRecordAt != null)
       'latest_record_at': latestRecordAt.toIso8601String(),
@@ -1858,6 +1908,24 @@ int _latestErrorIndex(List<Map<String, Object?>> records) {
   return -1;
 }
 
+int _latestHttpIndex(List<Map<String, Object?>> records, String target) {
+  final needle = target.toLowerCase();
+  for (var index = records.length - 1; index >= 0; index--) {
+    final record = records[index];
+    if (!_isHttpRecord(record)) {
+      continue;
+    }
+    final haystack = [
+      _recordValue(record, const ['path']),
+      _recordValue(record, const ['url']),
+    ].whereType<Object>().join(' ').toLowerCase();
+    if (haystack.contains(needle)) {
+      return index;
+    }
+  }
+  return -1;
+}
+
 List<Map<String, Object?>> _limitAroundLatest(
   List<Map<String, Object?>> records,
   int latestOffset,
@@ -1882,8 +1950,9 @@ List<int> _relatedContextIndexes(
   List<Map<String, Object?>> records,
   int latestIndex,
   int before,
-  int after,
-) {
+  int after, {
+  bool includeSessionId = true,
+}) {
   final indexes = <int>{};
   final windowStart = math.max(0, latestIndex - before);
   final windowEnd = math.min(records.length, latestIndex + after + 1);
@@ -1891,11 +1960,15 @@ List<int> _relatedContextIndexes(
     indexes.add(index);
   }
 
-  final latestIdentifiers = _recordIdentifiers(records[latestIndex]);
+  final latestIdentifiers = _recordIdentifiers(
+    records[latestIndex],
+    includeSessionId: includeSessionId,
+  );
   if (latestIdentifiers.isNotEmpty) {
     for (var index = 0; index < records.length; index++) {
       if (_recordIdentifiers(
         records[index],
+        includeSessionId: includeSessionId,
       ).intersection(latestIdentifiers).isNotEmpty) {
         indexes.add(index);
       }
@@ -1905,11 +1978,14 @@ List<int> _relatedContextIndexes(
   return indexes.toList()..sort();
 }
 
-Set<String> _recordIdentifiers(Map<String, Object?> record) {
-  const identifierKeys = [
+Set<String> _recordIdentifiers(
+  Map<String, Object?> record, {
+  bool includeSessionId = true,
+}) {
+  final identifierKeys = [
     ['trace_id', 'traceId'],
     ['request_id', 'requestId'],
-    ['session_id', 'sessionId'],
+    if (includeSessionId) ['session_id', 'sessionId'],
     ['user_id', 'userId'],
   ];
   final values = <String>{};
@@ -1926,6 +2002,204 @@ Set<String> _recordIdentifiers(Map<String, Object?> record) {
 
 bool _isHttpRecord(Map<String, Object?> record) {
   return _recordKind(record) == 'http';
+}
+
+List<Map<String, Object?>> _filterHttpRecords(
+  Iterable<Map<String, Object?>> records,
+  ArgResults command,
+) {
+  var filtered = records;
+  final path = _option(command, 'path');
+  if (path != null && path.isNotEmpty) {
+    final needle = path.toLowerCase();
+    filtered = filtered.where((record) {
+      final target = [
+        _recordValue(record, const ['path']),
+        _recordValue(record, const ['url']),
+      ].whereType<Object>().join(' ').toLowerCase();
+      return target.contains(needle);
+    });
+  }
+
+  final method = _option(command, 'method');
+  if (method != null && method.isNotEmpty) {
+    final expected = method.toUpperCase();
+    filtered = filtered.where((record) {
+      final value = _recordValue(record, const ['method']);
+      return value?.toString().toUpperCase() == expected;
+    });
+  }
+
+  final status = _optionalInt(_option(command, 'status'));
+  if (status != null) {
+    filtered = filtered.where((record) => _httpStatus(record) == status);
+  }
+
+  final since = _optionalDateTime(_option(command, 'since'));
+  if (since != null) {
+    filtered = filtered.where((record) {
+      final timestamp = _recordTimestamp(record);
+      return timestamp != null && !timestamp.isBefore(since);
+    });
+  }
+
+  final until = _optionalDateTime(_option(command, 'until'));
+  if (until != null) {
+    filtered = filtered.where((record) {
+      final timestamp = _recordTimestamp(record);
+      return timestamp != null && !timestamp.isAfter(until);
+    });
+  }
+
+  final contains = _option(command, 'contains');
+  if (contains != null && contains.isNotEmpty) {
+    final needle = contains.toLowerCase();
+    filtered = filtered.where((record) {
+      final encoded = jsonEncode(loghoundJsonSafe(record)).toLowerCase();
+      return encoded.contains(needle);
+    });
+  }
+
+  final results = filtered.toList(growable: false);
+  final limit = _optionalInt(_option(command, 'limit'));
+  if (limit == null || results.length <= limit) {
+    return results;
+  }
+  if (limit <= 0) {
+    return const [];
+  }
+  return results.sublist(results.length - limit);
+}
+
+int? _httpStatus(Map<String, Object?> record) {
+  final value = _recordValue(record, const ['status', 'status_code']);
+  if (value is int) {
+    return value;
+  }
+  if (value is num) {
+    return value.toInt();
+  }
+  if (value is String) {
+    return int.tryParse(value);
+  }
+  return null;
+}
+
+List<Map<String, Object?>> _httpEndpointSummaries(
+  Iterable<Map<String, Object?>> records,
+) {
+  final groups = <String, _HttpEndpointSummary>{};
+  for (final record in records) {
+    final method =
+        _recordValue(record, const ['method'])?.toString().toUpperCase() ??
+        'HTTP';
+    final path = _recordValue(record, const ['path'])?.toString();
+    final url = _recordValue(record, const ['url'])?.toString();
+    final target = path == null || path.isEmpty ? url ?? '' : path;
+    final endpoint = target.isEmpty ? method : '$method $target';
+    final group = groups.putIfAbsent(
+      endpoint,
+      () => _HttpEndpointSummary(
+        endpoint: endpoint,
+        method: method,
+        path: path,
+        url: url,
+      ),
+    );
+    group.add(record);
+  }
+  final summaries = [for (final group in groups.values) group.toJson()];
+  summaries.sort((left, right) {
+    final leftLatest = left['latest_at']?.toString() ?? '';
+    final rightLatest = right['latest_at']?.toString() ?? '';
+    return rightLatest.compareTo(leftLatest);
+  });
+  return summaries;
+}
+
+class _HttpEndpointSummary {
+  _HttpEndpointSummary({
+    required this.endpoint,
+    required this.method,
+    this.path,
+    this.url,
+  });
+
+  final String endpoint;
+  final String method;
+  final String? path;
+  final String? url;
+  final Map<String, int> statuses = {};
+  int count = 0;
+  int failures = 0;
+  int durationTotal = 0;
+  int durationCount = 0;
+  DateTime? latestTimestamp;
+  Object? latestAt;
+
+  void add(Map<String, Object?> record) {
+    count++;
+
+    final status = _httpStatus(record);
+    if (status != null) {
+      final key = status.toString();
+      statuses[key] = (statuses[key] ?? 0) + 1;
+    }
+    if (_isHttpFailure(record)) {
+      failures++;
+    }
+
+    final duration = _durationMs(record);
+    if (duration != null) {
+      durationTotal += duration;
+      durationCount++;
+    }
+
+    final timestamp = _recordTimestamp(record);
+    if (timestamp != null &&
+        (latestTimestamp == null || timestamp.isAfter(latestTimestamp!))) {
+      latestTimestamp = timestamp;
+      latestAt = record['timestamp'] ?? record['time'];
+    }
+  }
+
+  Map<String, Object?> toJson() {
+    return {
+      'endpoint': endpoint,
+      'method': method,
+      if (path != null) 'path': path,
+      if (url != null) 'url': url,
+      'count': count,
+      if (latestAt != null) 'latest_at': latestAt,
+      'statuses': statuses,
+      if (durationCount > 0)
+        'average_duration_ms': (durationTotal / durationCount).round(),
+      'failures': failures,
+    };
+  }
+}
+
+bool _isHttpFailure(Map<String, Object?> record) {
+  final status = _httpStatus(record);
+  if (status != null && status >= 400) {
+    return true;
+  }
+  final level = record['level'];
+  return level is num && level >= 900;
+}
+
+int? _durationMs(Map<String, Object?> record) {
+  final value = _recordValue(record, const ['duration_ms', 'durationMs']);
+  if (value is int) {
+    return value;
+  }
+  if (value is num) {
+    return value.round();
+  }
+  if (value is String) {
+    return int.tryParse(value);
+  }
+  return null;
 }
 
 String _recordKind(Map<String, Object?> record) {
@@ -1975,6 +2249,8 @@ Map<String, Object?> _httpSummary(Map<String, Object?> record) {
           'responseBodyBytes',
         ]) ??
         _bodyBytes(responseBody),
+    'request_body_captured': requestBody != null,
+    'response_body_captured': responseBody != null,
     if (_recordValue(record, const [
           'request_body_truncated',
           'requestBodyTruncated',
@@ -2139,6 +2415,7 @@ String _formatJsonLines(List<Map<String, Object?>> records) {
 String _formatMarkdownContext({
   required String source,
   required Map<String, Object?> latest,
+  String anchorHeading = 'Latest Error',
   required List<Map<String, Object?>> related,
   required int omitted,
 }) {
@@ -2147,7 +2424,7 @@ String _formatMarkdownContext({
     ..writeln()
     ..writeln('Source: `$source`')
     ..writeln()
-    ..writeln('## Latest Error')
+    ..writeln('## $anchorHeading')
     ..writeln()
     ..writeln('```json')
     ..writeln(jsonEncode(loghoundJsonSafe(latest)))
@@ -2249,6 +2526,99 @@ String _limitText(String text, int maxChars) {
   }
 
   return '${text.substring(0, maxChars - suffix.length)}$suffix';
+}
+
+bool _isHelpArg(List<String> args) {
+  return args.contains('--help') || args.contains('-h');
+}
+
+List<String> _commandPath(ArgResults command) {
+  final path = <String>[command.name!];
+  var nested = command.command;
+  while (nested != null) {
+    path.add(nested.name!);
+    nested = nested.command;
+  }
+  return path;
+}
+
+String _commandUsage(List<String> path) {
+  final parser = _parserForCommandPath(path);
+  final command = ['loghound', ...path].join(' ');
+  final description = _commandDescription(path);
+  final examples = _commandExamples(path);
+  return '''
+Usage: $command [options]
+
+$description
+
+Options:
+${parser.usage}
+
+Examples:
+$examples''';
+}
+
+ArgParser _parserForCommandPath(List<String> path) {
+  var parser = _buildParser();
+  for (final name in path) {
+    final next = parser.commands[name];
+    if (next == null) {
+      return parser;
+    }
+    parser = next;
+  }
+  return parser;
+}
+
+String _commandDescription(List<String> path) {
+  return switch (path.join(' ')) {
+    'query' => 'Filter records from a JSON Lines file or routed log store.',
+    'tail' => 'Print the latest records from a file or routed log store.',
+    'context' => 'Build AI-friendly context around an error or HTTP request.',
+    'actions' => 'Print semantic action records.',
+    'http list' => 'Print compact HTTP request/response summaries.',
+    'http summary' => 'Group HTTP records by endpoint.',
+    'http show' => 'Print one full HTTP record by request id.',
+    'doctor' => 'Check whether logs are ready for AI investigation.',
+    _ => 'Run a loghound command.',
+  };
+}
+
+String _commandExamples(List<String> path) {
+  return switch (path.join(' ')) {
+    'query' =>
+      '''
+  loghound query --file app.jsonl --contains purchase
+  loghound query --flavor dev --platform ios --session session-1 --request-id req-1''',
+    'tail' =>
+      '''
+  loghound tail --flavor dev --platform ios --session session-1 --count 80
+  loghound tail --file app.jsonl -n 20''',
+    'context' =>
+      '''
+  loghound context --flavor dev --platform ios --session session-1 --latest-error
+  loghound context --session session-1 --around-http /api/pages/me/messages''',
+    'actions' =>
+      '''
+  loghound actions --flavor dev --platform ios --session session-1''',
+    'http list' =>
+      '''
+  loghound http list --session session-1 --path /api/pages/me/messages --limit 20
+  loghound http list --file app.jsonl --status 500 --since 2026-07-09T02:00:00''',
+    'http summary' =>
+      '''
+  loghound http summary --session session-1
+  loghound http summary --path /api/pages/me/messages''',
+    'http show' =>
+      '''
+  loghound http show --session session-1 --request-id req-1''',
+    'doctor' =>
+      '''
+  loghound doctor --flavor dev --platform ios --session session-1
+  loghound doctor --max-age-minutes 30''',
+    _ => '  loghound --help',
+  };
 }
 
 String _usage(ArgParser parser) {
